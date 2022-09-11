@@ -581,7 +581,6 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
     }
 }
 
-// const remapped = remapClass(signature, &ctx.mappings.spigotToMojMap);
 fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8)) !void {
     var buf: [1024]u8 = undefined;
     var out = std.io.fixedBufferStream(&buf);
@@ -612,8 +611,6 @@ fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *
             var className = class[start..end];
 
             var remapped = spigotToMojMap.get(className);
-
-            //try stderr.print("remapping {s} -> {s}\n", .{ className, remapped });
 
             if (remapped != null) {
                 try writer.writeAll(remapped.?);
