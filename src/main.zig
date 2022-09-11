@@ -50,26 +50,22 @@ pub fn main() anyerror!void {
     // we don't need to handle multiple connections because JDWP doesn't work with multiple connections
     try stderr.print("waiting for connection on port {d}\n", .{proxyPort});
 
-    if (true) {
-        var proxyServer = std.net.StreamServer.init(.{});
-        defer proxyServer.deinit();
+    var proxyServer = std.net.StreamServer.init(.{});
+    defer proxyServer.deinit();
 
-        try proxyServer.listen(proxyAddress);
-        const connection = try proxyServer.accept();
-        const proxyStream = connection.stream;
-        defer proxyStream.close();
-        const proxyReader = proxyStream.reader();
-        const proxyWriter = proxyStream.writer();
+    try proxyServer.listen(proxyAddress);
+    const connection = try proxyServer.accept();
+    const proxyStream = connection.stream;
+    errdefer proxyStream.close();
+    const proxyReader = proxyStream.reader();
+    const proxyWriter = proxyStream.writer();
 
-        try stderr.print("connecting to jvm\n", .{});
+    try stderr.print("connecting to jvm\n", .{});
 
-        const jvmStream = try std.net.tcpConnectToAddress(jvmAddress);
-        defer jvmStream.close();
-        const jvmReader = jvmStream.reader();
-        const jvmWriter = jvmStream.writer();
+    const jvmStream = try std.net.tcpConnectToAddress(jvmAddress);
+    errdefer jvmStream.close();
+    const jvmReader = jvmStream.reader();
+    const jvmWriter = jvmStream.writer();
 
-        if (true) {
-            try proxy(proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, gpa);
-        }
-    }
+    try proxy(proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, .{ &jvmStream, &proxyStream }, gpa);
 }
