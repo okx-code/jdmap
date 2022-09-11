@@ -2,7 +2,7 @@
 
 ## The Problem
 
-When developing Spigot plugins, one will often want to develop with Mojang's official mappings. However, the Spigot server run on Spigot's mappings, and the class names and methods are all different. For plugins, Mojang mappings are converted to Spigot mappings during compilation, but this does not work for debugging, because the Java Debug Wire Protocol (JDWP) is text-based, and assumes that class names are the same both when developing and when running Java.
+When developing Spigot plugins, one will often want to develop with Mojang's official mappings. However, the Spigot server runs on Spigot's mappings, and the class names and methods are all different. For plugins, Mojang mappings are converted to Spigot mappings during compilation, but this does not work for debugging, because the Java Debug Wire Protocol (JDWP) is text-based, and assumes that class names are the same both when developing and when running Java.
 
 For example, if one sets a breakpoint at `net.minecraft.world.entity.monster.Zombie:263`, this will never be fired, because `Zombie` is the Mojang mapped name; the server only knows about `EntityZombie`, the spigot mapped name.
 
