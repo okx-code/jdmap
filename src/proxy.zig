@@ -1,5 +1,6 @@
 const std = @import("std");
 const Mappings = @import("mappings.zig").Mappings;
+const Options = @import("options.zig").Options;
 
 const HANDSHAKE_MAGIC = "JDWP-Handshake";
 const REPLY_FLAG: u8 = 0x80;
@@ -198,41 +199,46 @@ const Command = union(CommandSet) {
 
 const Proxy = struct {
     allocator: std.mem.Allocator,
-    commands: *std.AutoHashMapUnmanaged(u32, Command), // TODO CHECK FOR THREAD SAFETY HERE BECAUSE BOTH THREADS MODIFY THIS.
     mappings: *Mappings,
+    options: *Options,
+    commands: *std.AutoHashMapUnmanaged(u32, Command),
     fieldIDSize: u8 = 0,
     methodIDSize: u8 = 0,
     objectIDSize: u8 = 0,
     referenceTypeIDSize: u8 = 0,
     frameIDSize: u8 = 0,
-    terminate: std.atomic.Atomic(bool) = std.atomic.Atomic(bool).init(false),
+    terminate: bool = false,
+    mutex: std.Thread.Mutex = .{},
 };
 
 const stderr = std.io.getStdErr().writer();
 
-pub fn proxy(proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvmWriter: anytype, mappings: *Mappings, closeables: anytype, allocator: std.mem.Allocator) !void {
+pub fn proxy(proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvmWriter: anytype, mappings: *Mappings, options: *Options, closeables: anytype, reset: *std.Thread.ResetEvent, allocator: std.mem.Allocator) !void {
     var map = std.AutoHashMapUnmanaged(u32, Command){};
     defer map.deinit(allocator);
     var ctx: Proxy = .{
         .allocator = allocator,
         .commands = &map,
         .mappings = mappings,
+        .options = options,
     };
+
+    if (options.verbose) {
+        std.debug.print("verbose: attempting handshake\n", .{});
+    }
 
     try handshake(proxyReader, proxyWriter, jvmReader, jvmWriter);
 
-    try stderr.print("connection established\n", .{});
-
-    var reset: std.Thread.ResetEvent = undefined;
-    try reset.init();
-    defer reset.deinit();
+    std.debug.print("connection established\n", .{});
 
     // start two threads, one to receive from the jvm, one to receive from the proxy
-    const jvmThread = try std.Thread.spawn(.{}, handleJvmLoop, .{ &reset, &ctx, proxyWriter, jvmReader });
-    const proxyThread = try std.Thread.spawn(.{}, handleProxyLoop, .{ &reset, &ctx, proxyReader, jvmWriter });
+    const jvmThread = try std.Thread.spawn(.{}, handleJvmLoop, .{ reset, &ctx, proxyWriter, jvmReader });
+    const proxyThread = try std.Thread.spawn(.{}, handleProxyLoop, .{ reset, &ctx, proxyReader, jvmWriter });
 
     reset.wait();
-    ctx.terminate.store(true, std.atomic.Ordering.SeqCst);
+    ctx.mutex.lock();
+    ctx.terminate = true;
+    ctx.mutex.unlock();
 
     // Terminate both threads by closing the connection and causing an error, which is ignored.
     // https://github.com/ziglang/zig/issues/280
@@ -272,11 +278,14 @@ fn handleJvmLoop0(reset: *std.Thread.ResetEvent, ctx: *Proxy, proxyWriter: anyty
         receiveCommandOrReply(ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
             switch (e) {
                 error.EndOfStream => {
-                    if (ctx.terminate.load(std.atomic.Ordering.SeqCst)) {
+                    ctx.mutex.lock();
+                    const terminate = ctx.terminate;
+                    ctx.mutex.unlock();
+                    if (terminate) {
                         // connection was closed safely
                         return;
                     } else {
-                        try stderr.print("connection to jvm lost\n", .{});
+                        std.debug.print("connection to jvm lost\n", .{});
                         return;
                     }
                 },
@@ -296,11 +305,14 @@ fn handleProxyLoop(reset: *std.Thread.ResetEvent, ctx: *Proxy, proxyReader: std.
         forwardCommand(ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
             switch (e) {
                 error.EndOfStream => {
-                    if (ctx.terminate.load(std.atomic.Ordering.SeqCst)) {
+                    ctx.mutex.lock();
+                    const terminate = ctx.terminate;
+                    ctx.mutex.unlock();
+                    if (terminate) {
                         // connection was closed safely
                         return;
                     } else {
-                        try stderr.print("connection to proxy lost\n", .{});
+                        std.debug.print("connection to proxy lost\n", .{});
                         return;
                     }
                 },
@@ -324,23 +336,32 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
     const flags = try jvmReader.readIntBig(u8);
     try bufferWriter.writeIntBig(u8, flags);
 
-    //std.log.info("recv <- jvm {d} {d} {d}", .{ length, id, flags });
+    if (ctx.options.verbose) {
+        std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
+    }
 
     var dataSize: usize = length - 11;
     var buf: [1024]u8 = undefined;
 
     if (flags & REPLY_FLAG > 0) {
         // reply
-        //std.log.info("reply {d}", .{dataSize});
+        if (ctx.options.verbose) {
+            std.debug.print("verbose: reply {d}\n", .{dataSize});
+        }
         const errorCode = try jvmReader.readIntBig(u16);
         try bufferWriter.writeIntBig(u16, errorCode);
 
-        const commandRepliedTo = ctx.commands.get(id);
-        if (commandRepliedTo == null) {
-            // not replying to anything? what is going on
-            return ProxyError.InvalidProxy;
+        var commandRepliedTo: ?Command = undefined;
+        {
+            ctx.mutex.lock();
+            defer ctx.mutex.unlock();
+            commandRepliedTo = ctx.commands.get(id);
+            if (commandRepliedTo == null) {
+                // not replying to anything? what is going on
+                return ProxyError.InvalidProxy;
+            }
+            _ = ctx.commands.remove(id);
         }
-        _ = ctx.commands.remove(id);
 
         if (!switch (commandRepliedTo.?) {
             Command.VirtualMachine => |commandType| outer: {
@@ -364,11 +385,13 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         try bufferWriter.writeIntBig(u32, referenceTypeIDSize);
                         try bufferWriter.writeIntBig(u32, frameIDSize);
 
+                        ctx.mutex.lock();
                         ctx.fieldIDSize = @intCast(u8, fieldIDSize);
                         ctx.methodIDSize = @intCast(u8, methodIDSize);
                         ctx.objectIDSize = @intCast(u8, objectIDSize);
                         ctx.referenceTypeIDSize = @intCast(u8, referenceTypeIDSize);
                         ctx.frameIDSize = @intCast(u8, frameIDSize);
+                        ctx.mutex.unlock();
                         break :inner true;
                     },
                     // TODO Handle .AllClasses as well, although this is not called by IntelliJ
@@ -399,7 +422,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                             }
 
                             //std.log.info("signature: {s}", .{signature});
-                            try remapAndWriteClass(bufferWriter, signature, &ctx.mappings.spigotToMojMap);
+                            try remapAndWriteClass(bufferWriter, signature, &ctx.mappings.spigotToMojMap, ctx.options);
 
                             const genericStringLen: u32 = try jvmReader.readIntBig(u32);
                             try string.ensureTotalCapacity(ctx.allocator, genericStringLen);
@@ -432,6 +455,10 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
         const command = try jvmReader.readIntBig(u8);
         try bufferWriter.writeIntBig(u8, command);
 
+        if (ctx.options.verbose) {
+            std.debug.print("verbose: cmd in {d} {d}\n", .{ commandSet, command });
+        }
+
         while (dataSize > 0) {
             const read = try jvmReader.read(buf[0..@minimum(dataSize, buf.len)]);
             try bufferWriter.writeAll(buf[0..read]);
@@ -457,10 +484,13 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
     const flags = try proxyReader.readIntBig(u8);
     try bufferWriter.writeIntBig(u8, flags);
 
-    //std.log.info("send -> jvm {d} {d} {d}", .{ length, id, flags });
+    if (ctx.options.verbose) {
+        std.debug.print("verbose: send -> jvm {d} {d} {d}\n", .{ length, id, flags });
+    }
 
     var dataSize: usize = length - 11;
-    var buf: [1024]u8 = undefined;
+    // three 512 byte buffers
+    var buf: [1536]u8 = undefined;
 
     if ((flags & REPLY_FLAG) > 0) {
         return ProxyError.InvalidProxy; // we don't know how to forward replies to the jvm, this is an invalid operation
@@ -471,13 +501,22 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
         const command = try proxyReader.readIntBig(u8);
         try bufferWriter.writeIntBig(u8, command);
 
-        //std.log.info("cmd {d} {d}", .{ commandSet, command });
+        if (ctx.options.verbose) {
+            std.debug.print("verbose: cmd {d} {d}\n", .{ commandSet, command });
+        }
 
         const commandUnion: ?Command = toCommand(commandSet, command);
         if (commandUnion == null) {
+            if (ctx.options.verbose) {
+                std.debug.print("verbose: invalid command", .{});
+            }
             return ProxyError.InvalidProxy;
         }
-        try ctx.commands.put(ctx.allocator, id, commandUnion.?);
+        {
+            ctx.mutex.lock();
+            defer ctx.mutex.unlock();
+            try ctx.commands.put(ctx.allocator, id, commandUnion.?);
+        }
 
         if (!switch (commandUnion.?) {
             Command.EventRequest => |commandType| outer: {
@@ -496,6 +535,9 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                         while (modifierIndex < modifiers) : (modifierIndex += 1) {
                             const modKind = try proxyReader.readIntBig(u8);
                             try bufferWriter.writeIntBig(u8, modKind);
+                            if (ctx.options.verbose) {
+                                std.debug.print("verbose: mod {d}\n", .{modKind});
+                            }
                             if (modKind == 1) {
                                 const count = try proxyReader.readIntBig(u32);
                                 try bufferWriter.writeIntBig(u32, count);
@@ -527,9 +569,23 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                                 }
 
                                 var remapped = ctx.mappings.mojMapToSpigot.get(replacedString);
+                                if (remapped == null) {
+                                    for (ctx.options.remapKeys) |remapKey, rIndex| {
+                                        if (std.mem.startsWith(u8, replacedString, remapKey)) {
+                                            const value = ctx.options.remapValues[rIndex];
+                                            if (replacedString.len + value.len > 512) {
+                                                return ProxyError.InvalidProxy;
+                                            }
+                                            std.mem.copy(u8, buf[1024..1536], value);
+                                            std.mem.copy(u8, buf[1024 + value.len .. 1536], replacedString[remapKey.len..]);
+                                            remapped = buf[1024 .. 1024 + len - remapKey.len + value.len];
+                                            break;
+                                        }
+                                    }
+                                }
+
                                 if (remapped != null) {
                                     if (remapped.?.len > 512) return ProxyError.InvalidProxy;
-
                                     std.mem.copy(u8, buf[512..1024], remapped.?);
                                     var remappedReplacedString = buf[512 .. 512 + remapped.?.len];
                                     var remappedIndex: usize = 0;
@@ -538,7 +594,9 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                                             remappedReplacedString[remappedIndex] = '.';
                                         }
                                     }
-                                    std.log.info("out remap {s} -> {s}", .{ replacedString, remappedReplacedString });
+                                    if (ctx.options.verbose) {
+                                        std.debug.print("verbose: out remap {s} -> {s}\n", .{ buf[0..len], remappedReplacedString });
+                                    }
                                     try bufferWriter.writeIntBig(u32, @intCast(u32, remappedReplacedString.len));
                                     try bufferWriter.writeAll(remappedReplacedString);
                                 } else {
@@ -549,6 +607,7 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                                 const len = try proxyReader.readIntBig(u32);
                                 if (len > 1024) return ProxyError.InvalidProxy;
                                 try proxyReader.readNoEof(buf[0..len]);
+                                try bufferWriter.writeIntBig(u32, len);
                                 try bufferWriter.writeAll(buf[0..len]);
                             } else if (modKind == 7) {
                                 var refBuf: [9 + MAX_SIZE * 2]u8 = undefined;
@@ -579,6 +638,7 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                                 const len = try proxyReader.readIntBig(u32);
                                 if (len > 1024) return ProxyError.InvalidProxy;
                                 try proxyReader.readNoEof(buf[0..len]);
+                                try bufferWriter.writeIntBig(u32, len);
                                 try bufferWriter.writeAll(buf[0..len]);
                             }
                         }
@@ -604,12 +664,16 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
         try jvmWriter.writeIntBig(u32, len + 4); // plus four for the length itself
         try jvmWriter.writeAll(writeBuffer.items);
     } else |_| {
+        if (ctx.options.verbose) {
+            std.debug.print("verbose: input buffer too big", .{});
+        }
         return ProxyError.InvalidProxy;
     }
 }
 
-fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8)) !void {
+fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8), options: *Options) !void {
     var buf: [1024]u8 = undefined;
+    var buf2: [512]u8 = undefined;
     var out = std.io.fixedBufferStream(&buf);
     const writer = out.writer();
 
@@ -638,6 +702,20 @@ fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *
             var className = class[start..end];
 
             var remapped = spigotToMojMap.get(className);
+            if (remapped == null) {
+                for (options.remapValues) |remapKey, rIndex| {
+                    if (std.mem.startsWith(u8, className, remapKey)) {
+                        const value = options.remapKeys[rIndex];
+                        if (className.len + value.len > 512) {
+                            return ProxyError.InvalidProxy;
+                        }
+                        std.mem.copy(u8, buf2[0..512], value);
+                        std.mem.copy(u8, buf2[value.len..512], className[remapKey.len..]);
+                        remapped = buf2[0 .. className.len - remapKey.len + value.len];
+                        break;
+                    }
+                }
+            }
 
             if (remapped != null) {
                 try writer.writeAll(remapped.?);

@@ -26,4 +26,4 @@ The `jvm port` is the port of the JVM which a debugger can connect to. The `prox
 
 ### Development
 
-This project is in a very early stage of development and only translates class names and allows you to place breakpoints. It does not translate method names yet, and there is no configuration. Expect things to not work perfectly.
+This project is in a very early stage of development and only translates class names and allows you to place breakpoints. It does not translate method names yet, and there is very little configuration. Expect things to not work perfectly.

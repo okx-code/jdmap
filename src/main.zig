@@ -1,6 +1,11 @@
 const std = @import("std");
 const proxy = @import("proxy.zig").proxy;
 const Mappings = @import("mappings.zig").Mappings;
+const options = @import("options.zig");
+
+const stderr = std.io.getStdErr().writer();
+
+var globalStop: ?std.Thread.ResetEvent = null;
 
 pub fn main() anyerror!void {
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
@@ -10,28 +15,33 @@ pub fn main() anyerror!void {
     const args = try std.process.argsAlloc(gpa);
     defer gpa.free(args);
 
-    const stderr = std.io.getStdErr().writer();
-
     if (args.len < 1) {
-        try stderr.print("expected program directory in argument list\n", .{});
-        std.process.exit(1);
-    } else if (args.len < 4) {
-        try stderr.print("usage: {s} <source jvm port> <listen proxy port> <mappings file>\n", .{args[0]});
+        stderr.print("expected program directory in argument list\n", .{}) catch {};
         std.process.exit(1);
     }
 
-    const programArgs = args[1..];
+    var opts = options.Options.parse(args[1..], gpa);
+    if (opts == null) {
+        // error message was already printed
+        std.process.exit(1);
+    }
+    defer opts.?.deinit(gpa);
+    const programArgs = opts.?.arguments;
+    if (programArgs.len < 3) {
+        stderr.print(options.USAGE, .{args[0]}) catch {};
+        std.process.exit(1);
+    }
 
     const jvmPort = std.fmt.parseUnsigned(u16, programArgs[0], 10) catch {
-        try stderr.print("unable to parse jvm port \"{s}\"\n", .{programArgs[0]});
+        stderr.print("unable to parse jvm port: {s}\n", .{programArgs[0]}) catch {};
         std.process.exit(1);
     };
     const proxyPort = std.fmt.parseUnsigned(u16, programArgs[1], 10) catch {
-        try stderr.print("unable to parse proxy port \"{s}\"\n", .{programArgs[1]});
+        stderr.print("unable to parse proxy port: {s}\n", .{programArgs[1]}) catch {};
         std.process.exit(1);
     };
 
-    try stderr.print("loading mappings\n", .{});
+    stderr.print("loading mappings\n", .{}) catch {};
 
     // open read only
     const mappingsFile = try std.fs.cwd().openFile(programArgs[2], .{});
@@ -48,7 +58,7 @@ pub fn main() anyerror!void {
     defer mappings.deinit(gpa);
 
     // we don't need to handle multiple connections because JDWP doesn't work with multiple connections
-    try stderr.print("waiting for connection on port {d}\n", .{proxyPort});
+    stderr.print("waiting for connection on port {d}\n", .{proxyPort}) catch {};
 
     var proxyServer = std.net.StreamServer.init(.{});
     defer proxyServer.deinit();
@@ -60,12 +70,34 @@ pub fn main() anyerror!void {
     const proxyReader = proxyStream.reader();
     const proxyWriter = proxyStream.writer();
 
-    try stderr.print("connecting to jvm\n", .{});
+    stderr.print("connecting to jvm\n", .{}) catch {};
 
     const jvmStream = try std.net.tcpConnectToAddress(jvmAddress);
     errdefer jvmStream.close();
     const jvmReader = jvmStream.reader();
     const jvmWriter = jvmStream.writer();
 
-    try proxy(proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, .{ &jvmStream, &proxyStream }, gpa);
+    var reset: std.Thread.ResetEvent = undefined;
+    try reset.init();
+    defer reset.deinit();
+
+    globalStop = reset;
+
+    if (@import("builtin").os.tag == .linux) {
+        const handler: std.os.Sigaction = .{
+            .handler = .{ .handler = stopEventLoop },
+            .mask = std.os.empty_sigset,
+            .flags = 0,
+        };
+        std.os.sigaction(std.os.SIG.INT, &handler, null);
+        std.os.sigaction(std.os.SIG.TERM, &handler, null);
+    }
+
+    try proxy(proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, &globalStop.?, gpa);
+}
+
+export fn stopEventLoop(_: c_int) void {
+    if (globalStop != null) {
+        globalStop.?.set();
+    }
 }
