@@ -5,7 +5,8 @@ const stderr = std.io.getStdErr().writer();
 pub const USAGE =
     \\Usage: {s} [OPTION]... <source jvm port> <listen proxy port> <mappings file>
     \\Start a JDWP TCP proxy given the mappings file.
-    \\Example: {0s} -v -r 'org/bukkit/craftbukkit:org/bukkit/craftbukkit/v1_19_R1' -x 'org.bukkit.craftbukkit.Main*' 5005 5006 reobf.tiny
+    //\\Example: {0s} -v -r 'org/bukkit/craftbukkit:org/bukkit/craftbukkit/v1_19_R1' -x 'org.bukkit.craftbukkit.Main*' 5005 5006 reobf.tiny
+    \\Example: {0s} -v -r 'org/bukkit/craftbukkit:org/bukkit/craftbukkit/v1_19_R1' 5005 5006 reobf.tiny
     \\
     \\Options:
     \\  -r, --remap      Separated by a colon, remap the first package on the proxy to the second package on the JVM.
@@ -38,13 +39,13 @@ pub const Options = struct {
                 break;
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
                 options.verbose = true;
-                //} else if (std.mem.eql(u8, arg, "-x") or std.mem.eql(u8, arg, "--exclude")) {
-                //var exclude = next(args, &index);
-                //if (exclude == null) {
-                //stderr.print("expected string after flag {s}\n", .{arg}) catch {};
-                //return null;
-                //}
-                //excludeList.append(allocator, exclude.?) catch {};
+            } else if (std.mem.eql(u8, arg, "-x") or std.mem.eql(u8, arg, "--exclude")) {
+                var exclude = next(args, &index);
+                if (exclude == null) {
+                    stderr.print("expected string after flag {s}\n", .{arg}) catch {};
+                    return null;
+                }
+                excludeList.append(allocator, exclude.?) catch {};
             } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--remap")) {
                 var remap = next(args, &index);
                 if (remap == null) {

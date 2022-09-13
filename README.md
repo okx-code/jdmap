@@ -17,9 +17,13 @@ This CLI program acts as a TCP proxy for JDWP and allows you to place breakpoint
 ### Usage
 
 ```
-jdmap <jvm port> <proxy port> <mappings file>
-example:
-jdmap 5005 5006 reobf.tiny
+Usage: jdmap [OPTION]... <source jvm port> <listen proxy port> <mappings file>
+Start a JDWP TCP proxy given the mappings file.
+Example: jdmap -v -r 'org/bukkit/craftbukkit:org/bukkit/craftbukkit/v1_19_R1' 5005 5006 reobf.tiny
+
+Options:
+  -r, --remap      Separated by a colon, remap the first package on the proxy to the second package on the JVM.
+  -v, --verbose    Output details of packets sent and received.
 ```
 
 The `jvm port` is the port of the JVM which a debugger can connect to. The `proxy port` is the port that the remapper proxy will listen for and wait for a debugger to connect to. The `mappings file` is the file used for converting between Spigot and Mojang mappings. It can be found in a Paper JAR under the name `reobf.tiny`, and starts with `tiny    2       0       mojang+yarn     spigot`.
