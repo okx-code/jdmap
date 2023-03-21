@@ -64,6 +64,19 @@ pub fn main() anyerror!void {
     defer proxyServer.deinit();
 
     try proxyServer.listen(proxyAddress);
+
+    if (proxyServer.sockfd) |sockfd| {
+        const value = [_]i32{1};
+        const setopt: usize = std.os.linux.setsockopt(sockfd, std.os.linux.SOL.SOCKET, std.os.linux.SO.REUSEADDR, @ptrCast([*]const u8, &value), @sizeOf(i32));
+        if (setopt != 0) {
+            stderr.print("setsockopt failed: {s}\n", .{@tagName(std.os.linux.getErrno(setopt))}) catch {};
+            std.process.exit(1);
+        }
+    } else {
+        stderr.print("sockfd not present?\n", .{}) catch {};
+        std.process.exit(1);
+    }
+
     const connection = try proxyServer.accept();
     const proxyStream = connection.stream;
     errdefer proxyStream.close();
