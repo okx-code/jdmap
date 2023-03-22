@@ -202,25 +202,40 @@ const Proxy = struct {
     mappings: *Mappings,
     options: *Options,
     commands: *std.AutoHashMapUnmanaged(u32, Command),
+    classesObf: *std.AutoHashMapUnmanaged([MAX_SIZE]u8, []const u8), // class IDs to obfsucated class names
+    fieldRequests: *std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8), // packet ID to reference type ID
     fieldIDSize: u8 = 0,
     methodIDSize: u8 = 0,
     objectIDSize: u8 = 0,
     referenceTypeIDSize: u8 = 0,
     frameIDSize: u8 = 0,
     terminate: bool = false,
-    mutex: std.Thread.Mutex = .{},
 };
 
 const stderr = std.io.getStdErr().writer();
 
-pub fn proxy(proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvmWriter: anytype, mappings: *Mappings, options: *Options, closeables: anytype, reset: *std.Thread.ResetEvent, allocator: std.mem.Allocator) !void {
+pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvmWriter: anytype, mappings: *Mappings, options: *Options, closeables: anytype, allocator: std.mem.Allocator) !void {
+    _ = closeables;
+
     var map = std.AutoHashMapUnmanaged(u32, Command){};
     defer map.deinit(allocator);
+    var classesObf = std.AutoHashMapUnmanaged([MAX_SIZE]u8, []const u8){};
+    defer {
+        var it = classesObf.iterator();
+        while (it.next()) |kv| {
+            allocator.free(kv.value_ptr.*);
+        }
+        classesObf.deinit(allocator);
+    }
+    var fieldRequests = std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8){};
+    defer fieldRequests.deinit(allocator);
     var ctx: Proxy = .{
         .allocator = allocator,
         .commands = &map,
         .mappings = mappings,
         .options = options,
+        .fieldRequests = &fieldRequests,
+        .classesObf = &classesObf,
     };
 
     if (options.verbose) {
@@ -231,24 +246,45 @@ pub fn proxy(proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvm
 
     std.debug.print("connection established\n", .{});
 
-    // start two threads, one to receive from the jvm, one to receive from the proxy
-    const jvmThread = try std.Thread.spawn(.{}, handleJvmLoop, .{ reset, &ctx, proxyWriter, jvmReader });
-    const proxyThread = try std.Thread.spawn(.{}, handleProxyLoop, .{ reset, &ctx, proxyReader, jvmWriter });
+    const epfd = try std.os.epoll_create1(0);
+    var jvmIn: std.os.linux.epoll_event = .{ .events = std.os.linux.EPOLL.IN, .data = .{ .fd = jvmStream } };
+    try std.os.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, jvmStream, &jvmIn);
+    var proxyIn: std.os.linux.epoll_event = .{ .events = std.os.linux.EPOLL.IN, .data = .{ .fd = proxyStream } };
+    try std.os.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, proxyStream, &proxyIn);
 
-    reset.wait();
-    ctx.mutex.lock();
-    ctx.terminate = true;
-    ctx.mutex.unlock();
+    var events: [10]std.os.linux.epoll_event = undefined;
+    while (true) {
+        var eventCount = std.os.epoll_wait(epfd, &events, -1);
 
-    // Terminate both threads by closing the connection and causing an error, which is ignored.
-    // https://github.com/ziglang/zig/issues/280
-    comptime var idx: usize = 0;
-    inline while (idx < closeables.len) : (idx += 1) {
-        try std.os.shutdown(closeables[idx].handle, std.os.ShutdownHow.both);
+        var i: u32 = 0;
+        var writeBuffer = std.ArrayListUnmanaged(u8){};
+        defer writeBuffer.deinit(ctx.allocator);
+        while (i < eventCount) : (i += 1) {
+            if (events[i].data.fd == jvmStream) {
+                receiveCommandOrReply(&ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
+                    switch (e) {
+                        error.EndOfStream => {
+                            std.debug.print("connection to jvm lost\n", .{});
+                            return;
+                        },
+                        else => return e,
+                    }
+                };
+                writeBuffer.clearRetainingCapacity();
+            } else if (events[i].data.fd == proxyStream) {
+                forwardCommand(&ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
+                    switch (e) {
+                        error.EndOfStream => {
+                            std.debug.print("connection to proxy lost\n", .{});
+                            return;
+                        },
+                        else => return e,
+                    }
+                };
+                writeBuffer.clearRetainingCapacity();
+            }
+        }
     }
-
-    jvmThread.join();
-    proxyThread.join();
 }
 
 fn handshake(proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvmWriter: anytype) !void {
@@ -265,65 +301,6 @@ fn handshake(proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvm
     try proxyWriter.writeAll(HANDSHAKE_MAGIC);
 }
 
-fn handleJvmLoop(reset: *std.Thread.ResetEvent, ctx: *Proxy, proxyWriter: std.io.Writer(std.net.Stream, std.os.WriteError, std.net.Stream.write), jvmReader: std.io.Reader(std.net.Stream, std.os.ReadError, std.net.Stream.read)) !void {
-    try handleJvmLoop0(reset, ctx, proxyWriter, jvmReader);
-}
-
-fn handleJvmLoop0(reset: *std.Thread.ResetEvent, ctx: *Proxy, proxyWriter: anytype, jvmReader: anytype) !void {
-    defer reset.set();
-
-    var writeBuffer = std.ArrayListUnmanaged(u8){};
-    defer writeBuffer.deinit(ctx.allocator);
-    while (true) {
-        receiveCommandOrReply(ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
-            switch (e) {
-                error.EndOfStream => {
-                    ctx.mutex.lock();
-                    const terminate = ctx.terminate;
-                    ctx.mutex.unlock();
-                    if (terminate) {
-                        // connection was closed safely
-                        return;
-                    } else {
-                        std.debug.print("connection to jvm lost\n", .{});
-                        return;
-                    }
-                },
-                else => return e,
-            }
-        };
-        writeBuffer.clearRetainingCapacity();
-    }
-}
-
-fn handleProxyLoop(reset: *std.Thread.ResetEvent, ctx: *Proxy, proxyReader: std.io.Reader(std.net.Stream, std.os.ReadError, std.net.Stream.read), jvmWriter: std.io.Writer(std.net.Stream, std.os.WriteError, std.net.Stream.write)) !void {
-    defer reset.set();
-
-    var writeBuffer = std.ArrayListUnmanaged(u8){};
-    defer writeBuffer.deinit(ctx.allocator);
-    while (true) {
-        forwardCommand(ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
-            switch (e) {
-                error.EndOfStream => {
-                    ctx.mutex.lock();
-                    const terminate = ctx.terminate;
-                    ctx.mutex.unlock();
-                    if (terminate) {
-                        // connection was closed safely
-                        return;
-                    } else {
-                        std.debug.print("connection to proxy lost\n", .{});
-                        return;
-                    }
-                },
-                else => return e,
-            }
-        };
-
-        writeBuffer.clearRetainingCapacity();
-    }
-}
-
 fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyWriter: anytype, jvmReader: anytype) !void {
     // Create a separate writer as a buffer, which will be flushed once we know the full length
     // We cannot write directly to the TCP stream `proxyWriter` until we know the remapped length.
@@ -337,7 +314,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
     try bufferWriter.writeIntBig(u8, flags);
 
     if (ctx.options.verbose) {
-        std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
+        //std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
     }
 
     var dataSize: usize = length - 11;
@@ -346,15 +323,13 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
     if (flags & REPLY_FLAG > 0) {
         // reply
         if (ctx.options.verbose) {
-            std.debug.print("verbose: reply {d}\n", .{dataSize});
+            //std.debug.print("verbose: reply {d}\n", .{dataSize});
         }
         const errorCode = try jvmReader.readIntBig(u16);
         try bufferWriter.writeIntBig(u16, errorCode);
 
         var commandRepliedTo: ?Command = undefined;
         {
-            ctx.mutex.lock();
-            defer ctx.mutex.unlock();
             commandRepliedTo = ctx.commands.get(id);
             if (commandRepliedTo == null) {
                 // not replying to anything? what is going on
@@ -385,17 +360,15 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         try bufferWriter.writeIntBig(u32, referenceTypeIDSize);
                         try bufferWriter.writeIntBig(u32, frameIDSize);
 
-                        ctx.mutex.lock();
                         ctx.fieldIDSize = @intCast(u8, fieldIDSize);
                         ctx.methodIDSize = @intCast(u8, methodIDSize);
                         ctx.objectIDSize = @intCast(u8, objectIDSize);
                         ctx.referenceTypeIDSize = @intCast(u8, referenceTypeIDSize);
                         ctx.frameIDSize = @intCast(u8, frameIDSize);
-                        ctx.mutex.unlock();
                         break :inner true;
                     },
                     // TODO Handle .AllClasses as well, although this is not called by IntelliJ
-                    .AllClassesWithGeneric => inner: {
+                    .AllClassesWithGeneric, .AllClasses => inner: {
                         const classCount = try jvmReader.readIntBig(u32);
                         try bufferWriter.writeIntBig(u32, classCount);
                         var class: u32 = 0;
@@ -405,7 +378,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                             const classKind = try jvmReader.readIntBig(u8);
                             try bufferWriter.writeIntBig(u8, classKind);
 
-                            var refBuf: [MAX_SIZE]u8 = undefined;
+                            var refBuf: [MAX_SIZE]u8 = [_]u8{0} ** MAX_SIZE;
                             var bufRefType = refBuf[0..ctx.referenceTypeIDSize];
                             try jvmReader.readNoEof(bufRefType);
                             try bufferWriter.writeAll(bufRefType);
@@ -421,16 +394,16 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                                 return ProxyError.InvalidProxy;
                             }
 
-                            //std.log.info("signature: {s}", .{signature});
-                            try remapAndWriteClass(bufferWriter, signature, &ctx.mappings.spigotToMojMap, ctx.options);
+                            try remapAndWriteClass(ctx.allocator, bufferWriter, signature, &ctx.mappings.spigotToMojMap, ctx.options, refBuf, ctx.classesObf);
 
-                            const genericStringLen: u32 = try jvmReader.readIntBig(u32);
-                            try string.ensureTotalCapacity(ctx.allocator, genericStringLen);
-                            string.expandToCapacity();
-                            try jvmReader.readNoEof(string.items[0..genericStringLen]);
-                            //std.log.info("generic signature: {s}", .{string.items[0..genericStringLen]});
-                            try bufferWriter.writeIntBig(u32, genericStringLen);
-                            try bufferWriter.writeAll(string.items[0..genericStringLen]);
+                            if (commandType == VirtualMachineCommands.AllClassesWithGeneric) {
+                                const genericStringLen: u32 = try jvmReader.readIntBig(u32);
+                                try string.ensureTotalCapacity(ctx.allocator, genericStringLen);
+                                string.expandToCapacity();
+                                try jvmReader.readNoEof(string.items[0..genericStringLen]);
+                                try bufferWriter.writeIntBig(u32, genericStringLen);
+                                try bufferWriter.writeAll(string.items[0..genericStringLen]);
+                            }
 
                             const status: u32 = try jvmReader.readIntBig(u32);
                             try bufferWriter.writeIntBig(u32, status);
@@ -440,10 +413,83 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                     else => false,
                 };
             },
+            Command.ReferenceType => |commandType| outer: {
+                break :outer switch (commandType) {
+                    .FieldsWithGeneric => inner: {
+                        const classRef = ctx.fieldRequests.get(id);
+                        if (classRef == null) {
+                            return ProxyError.InvalidProxy;
+                        }
+
+                        var maxFieldBuf: [MAX_SIZE]u8 = undefined;
+                        var fieldBuf = maxFieldBuf[0..ctx.fieldIDSize];
+
+                        const declaredFields: u32 = try jvmReader.readIntBig(u32);
+                        try bufferWriter.writeIntBig(u32, declaredFields);
+
+                        var string = std.ArrayListUnmanaged(u8){};
+                        defer string.deinit(ctx.allocator);
+
+                        var fieldIndex: u32 = 0;
+
+                        while (fieldIndex < declaredFields) : (fieldIndex += 1) {
+                            try jvmReader.readNoEof(fieldBuf);
+                            try bufferWriter.writeAll(fieldBuf);
+
+                            const nameStringLen: u32 = try jvmReader.readIntBig(u32);
+                            try string.ensureTotalCapacity(ctx.allocator, nameStringLen);
+                            string.expandToCapacity();
+                            try jvmReader.readNoEof(string.items[0..nameStringLen]);
+                            if (ctx.options.verbose) {
+                                std.debug.print("name: {s}\n", .{string.items[0..nameStringLen]});
+                            }
+
+                            var name: []const u8 = string.items[0..nameStringLen];
+
+                            const classNameOpt = ctx.classesObf.get(classRef.?);
+                            if (classNameOpt) |className| {
+                                const fieldsOpt = ctx.mappings.spigotToSpigotFieldsToMojMapFields.get(className);
+                                if (fieldsOpt) |fields| {
+                                    if (fields.get(name)) |fieldName| {
+                                        if (ctx.options.verbose) {
+                                            std.debug.print("verbose: remap field {s} {s} -> {s}\n", .{ className, name, fieldName });
+                                        }
+                                        name = fieldName;
+                                    }
+                                }
+                            }
+
+                            //try bufferWriter.writeIntBig(u32, nameStringLen);
+                            //try bufferWriter.writeAll(string.items[0..nameStringLen]);
+                            try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
+                            try bufferWriter.writeAll(name);
+
+                            const signatureLen: u32 = try jvmReader.readIntBig(u32);
+                            try string.ensureTotalCapacity(ctx.allocator, signatureLen);
+                            string.expandToCapacity();
+                            try jvmReader.readNoEof(string.items[0..signatureLen]);
+                            try bufferWriter.writeIntBig(u32, signatureLen);
+                            try bufferWriter.writeAll(string.items[0..signatureLen]);
+
+                            const genericSignatureLen: u32 = try jvmReader.readIntBig(u32);
+                            try string.ensureTotalCapacity(ctx.allocator, genericSignatureLen);
+                            string.expandToCapacity();
+                            try jvmReader.readNoEof(string.items[0..genericSignatureLen]);
+                            try bufferWriter.writeIntBig(u32, genericSignatureLen);
+                            try bufferWriter.writeAll(string.items[0..genericSignatureLen]);
+
+                            const modBits: u32 = try jvmReader.readIntBig(u32);
+                            try bufferWriter.writeIntBig(u32, modBits);
+                        }
+                        break :inner true;
+                    },
+                    else => false,
+                };
+            },
             else => false,
         }) {
             while (dataSize > 0) {
-                const read = try jvmReader.read(buf[0..@minimum(dataSize, buf.len)]);
+                const read = try jvmReader.read(buf[0..@min(dataSize, buf.len)]);
                 try bufferWriter.writeAll(buf[0..read]);
                 dataSize -= read;
             }
@@ -460,18 +506,14 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
         }
 
         while (dataSize > 0) {
-            const read = try jvmReader.read(buf[0..@minimum(dataSize, buf.len)]);
+            const read = try jvmReader.read(buf[0..@min(dataSize, buf.len)]);
             try bufferWriter.writeAll(buf[0..read]);
             dataSize -= read;
         }
     }
 
-    if (std.math.cast(u32, writeBuffer.items.len)) |len| {
-        try proxyWriter.writeIntBig(u32, len + 4); // plus four for the length itself
-        try proxyWriter.writeAll(writeBuffer.items);
-    } else |_| {
-        return ProxyError.InvalidProxy;
-    }
+    try proxyWriter.writeIntBig(u32, @intCast(u32, writeBuffer.items.len) + 4); // plus four for the length itself
+    try proxyWriter.writeAll(writeBuffer.items);
 }
 
 fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyReader: anytype, jvmWriter: anytype) !void {
@@ -485,7 +527,7 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
     try bufferWriter.writeIntBig(u8, flags);
 
     if (ctx.options.verbose) {
-        std.debug.print("verbose: send -> jvm {d} {d} {d}\n", .{ length, id, flags });
+        //std.debug.print("verbose: send -> jvm {d} {d} {d}\n", .{ length, id, flags });
     }
 
     var dataSize: usize = length - 11;
@@ -501,22 +543,20 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
         const command = try proxyReader.readIntBig(u8);
         try bufferWriter.writeIntBig(u8, command);
 
-        if (ctx.options.verbose) {
-            std.debug.print("verbose: cmd {d} {d}\n", .{ commandSet, command });
-        }
-
-        const commandUnion: ?Command = toCommand(commandSet, command);
+        var enumType: [:0]const u8 = undefined;
+        const commandUnion: ?Command = toCommand(commandSet, command, &enumType);
         if (commandUnion == null) {
             if (ctx.options.verbose) {
-                std.debug.print("verbose: invalid command", .{});
+                std.debug.print("verbose: invalid command {d} {d}\n", .{ commandSet, command });
             }
             return ProxyError.InvalidProxy;
         }
-        {
-            ctx.mutex.lock();
-            defer ctx.mutex.unlock();
-            try ctx.commands.put(ctx.allocator, id, commandUnion.?);
+
+        if (ctx.options.verbose) {
+            std.debug.print("verbose: cmd {d} {d} ({s}.{s})\n", .{ commandSet, command, @tagName(commandUnion.?), enumType });
         }
+
+        try ctx.commands.put(ctx.allocator, id, commandUnion.?);
 
         if (!switch (commandUnion.?) {
             Command.EventRequest => |commandType| outer: {
@@ -570,7 +610,7 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
 
                                 var remapped = ctx.mappings.mojMapToSpigot.get(replacedString);
                                 if (remapped == null) {
-                                    for (ctx.options.remapKeys) |remapKey, rIndex| {
+                                    for (ctx.options.remapKeys, 0..) |remapKey, rIndex| {
                                         if (std.mem.startsWith(u8, replacedString, remapKey)) {
                                             const value = ctx.options.remapValues[rIndex];
                                             if (replacedString.len + value.len > 512) {
@@ -648,30 +688,39 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                     else => false,
                 };
             },
+            Command.ReferenceType => |commandType| outer: {
+                break :outer switch (commandType) {
+                    .FieldsWithGeneric => inner: {
+                        var maxRefBuf: [MAX_SIZE]u8 = [_]u8{0} ** MAX_SIZE;
+                        var refBuf = maxRefBuf[0..ctx.referenceTypeIDSize];
+                        try proxyReader.readNoEof(refBuf);
+                        try bufferWriter.writeAll(refBuf);
+
+                        try ctx.fieldRequests.put(ctx.allocator, id, maxRefBuf);
+                        // todo note the reference type id to help with the reply
+                        break :inner true;
+                    },
+                    else => false,
+                };
+            },
             else => false,
         }) {
             while (dataSize > 0) {
-                const read = try proxyReader.read(buf[0..@minimum(dataSize, buf.len)]);
-                if (commandSet == 15 and command == 1) {
-                    std.debug.print("{s}\n{any}", .{ buf[0..read], buf[0..read] });
-                }
+                const read = try proxyReader.read(buf[0..@min(dataSize, buf.len)]);
+                //if (commandSet == 15 and command == 1) {
+                //   std.debug.print("{s}\n{any}", .{ buf[0..read], buf[0..read] });
+                //}
                 try bufferWriter.writeAll(buf[0..read]);
                 dataSize -= read;
             }
         }
     }
-    if (std.math.cast(u32, writeBuffer.items.len)) |len| {
-        try jvmWriter.writeIntBig(u32, len + 4); // plus four for the length itself
-        try jvmWriter.writeAll(writeBuffer.items);
-    } else |_| {
-        if (ctx.options.verbose) {
-            std.debug.print("verbose: input buffer too big", .{});
-        }
-        return ProxyError.InvalidProxy;
-    }
+
+    try jvmWriter.writeIntBig(u32, @intCast(u32, writeBuffer.items.len) + 4); // plus four for the length itself
+    try jvmWriter.writeAll(writeBuffer.items);
 }
 
-fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8), options: *Options) !void {
+fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8), options: *Options, refBuf: [MAX_SIZE]u8, classesObf: *std.AutoHashMapUnmanaged([MAX_SIZE]u8, []const u8)) !void {
     var buf: [1024]u8 = undefined;
     var buf2: [512]u8 = undefined;
     var out = std.io.fixedBufferStream(&buf);
@@ -703,7 +752,7 @@ fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *
 
             var remapped = spigotToMojMap.get(className);
             if (remapped == null) {
-                for (options.remapValues) |remapKey, rIndex| {
+                for (options.remapValues, 0..) |remapKey, rIndex| {
                     if (std.mem.startsWith(u8, className, remapKey)) {
                         const value = options.remapKeys[rIndex];
                         if (className.len + value.len > 512) {
@@ -715,8 +764,9 @@ fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *
                         break;
                     }
                 }
+            } else {
+                try classesObf.put(allocator, refBuf, try allocator.dupe(u8, className));
             }
-
             if (remapped != null) {
                 try writer.writeAll(remapped.?);
             } else {
@@ -732,32 +782,33 @@ fn remapAndWriteClass(proxyWriter: anytype, class: []const u8, spigotToMojMap: *
     try proxyWriter.writeAll(out.getWritten());
 }
 
-fn toCommand(commandSet: u8, command: u8) ?Command {
+fn toCommand(commandSet: u8, command: u8, enumType: *[:0]const u8) ?Command {
     return switch (commandSet) {
-        @enumToInt(CommandSet.VirtualMachine) => createUnion("VirtualMachine", VirtualMachineCommands, command),
-        @enumToInt(CommandSet.ReferenceType) => createUnion("ReferenceType", ReferenceTypeCommands, command),
-        @enumToInt(CommandSet.ClassType) => createUnion("ClassType", ClassTypeCommands, command),
-        @enumToInt(CommandSet.ArrayType) => createUnion("ArrayType", ArrayTypeCommands, command),
-        @enumToInt(CommandSet.InterfaceType) => createUnion("InterfaceType", InterfaceTypeCommands, command),
-        @enumToInt(CommandSet.Method) => createUnion("Method", MethodCommands, command),
-        @enumToInt(CommandSet.ObjectReference) => createUnion("ObjectReference", ObjectReferenceCommands, command),
-        @enumToInt(CommandSet.StringReference) => createUnion("StringReference", StringReferenceCommands, command),
-        @enumToInt(CommandSet.ThreadReference) => createUnion("ThreadReference", ThreadReferenceCommands, command),
-        @enumToInt(CommandSet.ThreadGroupReference) => createUnion("ThreadGroupReference", ThreadGroupReferenceCommands, command),
-        @enumToInt(CommandSet.ArrayReference) => createUnion("ArrayReference", ArrayReferenceCommands, command),
-        @enumToInt(CommandSet.ClassLoaderReference) => createUnion("ClassLoaderReference", ClassLoaderReferenceCommands, command),
-        @enumToInt(CommandSet.EventRequest) => createUnion("EventRequest", EventRequestCommands, command),
-        @enumToInt(CommandSet.StackFrame) => createUnion("StackFrame", StackFrameCommands, command),
-        @enumToInt(CommandSet.ClassObjectReference) => createUnion("ClassObjectReference", ClassObjectReferenceCommands, command),
-        @enumToInt(CommandSet.ModuleReference) => createUnion("ModuleReference", ModuleReferenceCommands, command),
-        @enumToInt(CommandSet.Event) => createUnion("Event", EventCommands, command),
+        @enumToInt(CommandSet.VirtualMachine) => createUnion("VirtualMachine", VirtualMachineCommands, command, enumType),
+        @enumToInt(CommandSet.ReferenceType) => createUnion("ReferenceType", ReferenceTypeCommands, command, enumType),
+        @enumToInt(CommandSet.ClassType) => createUnion("ClassType", ClassTypeCommands, command, enumType),
+        @enumToInt(CommandSet.ArrayType) => createUnion("ArrayType", ArrayTypeCommands, command, enumType),
+        @enumToInt(CommandSet.InterfaceType) => createUnion("InterfaceType", InterfaceTypeCommands, command, enumType),
+        @enumToInt(CommandSet.Method) => createUnion("Method", MethodCommands, command, enumType),
+        @enumToInt(CommandSet.ObjectReference) => createUnion("ObjectReference", ObjectReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.StringReference) => createUnion("StringReference", StringReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.ThreadReference) => createUnion("ThreadReference", ThreadReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.ThreadGroupReference) => createUnion("ThreadGroupReference", ThreadGroupReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.ArrayReference) => createUnion("ArrayReference", ArrayReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.ClassLoaderReference) => createUnion("ClassLoaderReference", ClassLoaderReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.EventRequest) => createUnion("EventRequest", EventRequestCommands, command, enumType),
+        @enumToInt(CommandSet.StackFrame) => createUnion("StackFrame", StackFrameCommands, command, enumType),
+        @enumToInt(CommandSet.ClassObjectReference) => createUnion("ClassObjectReference", ClassObjectReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.ModuleReference) => createUnion("ModuleReference", ModuleReferenceCommands, command, enumType),
+        @enumToInt(CommandSet.Event) => createUnion("Event", EventCommands, command, enumType),
         else => null,
     };
 }
 
-fn createUnion(comptime name: []const u8, enumType: type, commandValue: anytype) ?Command {
+fn createUnion(comptime name: []const u8, comptime enumType: type, commandValue: anytype, returnEnumType: *[:0]const u8) ?Command {
     inline for (@typeInfo(enumType).Enum.fields) |field| {
         if (field.value == commandValue) {
+            returnEnumType.* = @tagName(@intToEnum(enumType, commandValue));
             return @unionInit(Command, name, @intToEnum(enumType, commandValue));
         }
     }

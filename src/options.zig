@@ -10,6 +10,7 @@ pub const USAGE =
     \\
     \\Options:
     \\  -r, --remap      Separated by a colon, remap the first package on the proxy to the second package on the JVM.
+    //\\  -s, --restart    Automatically restart the proxy if the connection is terminated.
     //\\  -x, --exclude    Do not remap the given class(es), overrides other options. May use the * character.
     \\  -v, --verbose    Output details of packets sent and received.
     \\
@@ -58,7 +59,7 @@ pub const Options = struct {
                     stderr.print("colon not found in remap: {s}\n", .{remap.?}) catch {};
                     return null;
                 } else if (colon.? == 0 or colon.? >= remap.?.len - 1) {
-                    stderr.print("colon at index {d} at invalid position in: {s}\n", .{ colon, remap.? }) catch {};
+                    stderr.print("colon at index {d} at invalid position in: {s}\n", .{ colon.?, remap.? }) catch {};
                     return null;
                 }
 
@@ -72,9 +73,9 @@ pub const Options = struct {
             }
         }
         options.arguments = args[index..]; // won't be out of bounds if index + 1 == args.len
-        options.remapKeys = remapKeysList.toOwnedSlice(allocator);
-        options.remapValues = remapValuesList.toOwnedSlice(allocator);
-        options.exclude = excludeList.toOwnedSlice(allocator);
+        options.remapKeys = remapKeysList.toOwnedSlice(allocator) catch unreachable;
+        options.remapValues = remapValuesList.toOwnedSlice(allocator) catch unreachable;
+        options.exclude = excludeList.toOwnedSlice(allocator) catch unreachable;
         return options;
     }
 

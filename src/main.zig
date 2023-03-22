@@ -5,8 +5,6 @@ const options = @import("options.zig");
 
 const stderr = std.io.getStdErr().writer();
 
-var globalStop: ?std.Thread.ResetEvent = null;
-
 pub fn main() anyerror!void {
     var general_purpose_allocator = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = general_purpose_allocator.deinit();
@@ -43,22 +41,30 @@ pub fn main() anyerror!void {
 
     stderr.print("loading mappings\n", .{}) catch {};
 
-    // open read only
-    const mappingsFile = try std.fs.cwd().openFile(programArgs[2], .{});
-    defer mappingsFile.close();
+    const start: i64 = std.time.milliTimestamp();
 
-    const mappingsText = try mappingsFile.readToEndAlloc(gpa, std.math.maxInt(usize));
+    var mappingsText: []u8 = blk: {
+        // open read only
+        const mappingsFile = try std.fs.cwd().openFile(programArgs[2], .{});
+        defer mappingsFile.close();
+
+        break :blk try mappingsFile.readToEndAlloc(gpa, std.math.maxInt(usize));
+    };
     defer gpa.free(mappingsText);
-
-    const jvmAddress = std.net.Address.resolveIp("127.0.0.1", jvmPort) catch unreachable;
-    const proxyAddress = std.net.Address.resolveIp("127.0.0.1", proxyPort) catch unreachable;
-
     // this does not copy strings and just points to the mappings text, so the lifetime needs to be managed carefully.
     var mappings = try Mappings.parseMappings(mappingsText, gpa);
     defer mappings.deinit(gpa);
 
-    // we don't need to handle multiple connections because JDWP doesn't work with multiple connections
+    const end: i64 = std.time.milliTimestamp();
+
+    if (opts.?.verbose) {
+        stderr.print("verbose: loading mappings took {d} ms\n", .{end - start}) catch {};
+    }
+
     stderr.print("waiting for connection on port {d}\n", .{proxyPort}) catch {};
+
+    const jvmAddress = std.net.Address.resolveIp("127.0.0.1", jvmPort) catch unreachable;
+    const proxyAddress = std.net.Address.resolveIp("127.0.0.1", proxyPort) catch unreachable;
 
     var proxyServer = std.net.StreamServer.init(.{ .reuse_address = true });
     defer proxyServer.deinit();
@@ -78,27 +84,5 @@ pub fn main() anyerror!void {
     const jvmReader = jvmStream.reader();
     const jvmWriter = jvmStream.writer();
 
-    var reset: std.Thread.ResetEvent = undefined;
-    try reset.init();
-    defer reset.deinit();
-
-    globalStop = reset;
-
-    if (@import("builtin").os.tag == .linux) {
-        const handler: std.os.Sigaction = .{
-            .handler = .{ .handler = stopEventLoop },
-            .mask = std.os.empty_sigset,
-            .flags = 0,
-        };
-        std.os.sigaction(std.os.SIG.INT, &handler, null);
-        std.os.sigaction(std.os.SIG.TERM, &handler, null);
-    }
-
-    try proxy(proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, &globalStop.?, gpa);
-}
-
-export fn stopEventLoop(_: c_int) void {
-    if (globalStop != null) {
-        globalStop.?.set();
-    }
+    try proxy(jvmStream.handle, proxyStream.handle, proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, gpa);
 }
