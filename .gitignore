@@ -1,4 +1,4 @@
 log*
-reobf.tiny
+reobf*.tiny
 zig-cache/
 zig-out/

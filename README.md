@@ -26,7 +26,7 @@ Options:
   -v, --verbose    Output details of packets sent and received.
 ```
 
-The `jvm port` is the port of the JVM which a debugger can connect to. The `proxy port` is the port that the remapper proxy will listen for and wait for a debugger to connect to. The `mappings file` is the file used for converting between Spigot and Mojang mappings. It can be found in a Paper JAR under the name `reobf.tiny`, and starts with `tiny    2       0       mojang+yarn     spigot`.
+The `jvm port` is the port of the JVM which a debugger can connect to. The `proxy port` is the port that the remapper proxy will listen for and wait for a debugger to connect to. The `mappings file` is the file used for converting between Spigot and Mojang mappings. It can be found on a server in (for example) `versions/1.18.2/paper-1.18.2.jar` in `META-INF/mappings` under the name `reobf.tiny`, and starts with `tiny    2       0       mojang+yarn     spigot`.
 
 ### Development
 
