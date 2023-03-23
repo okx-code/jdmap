@@ -84,5 +84,9 @@ pub fn main() anyerror!void {
     const jvmReader = jvmStream.reader();
     const jvmWriter = jvmStream.writer();
 
+    var val: i32 = 1;
+    _ = std.os.linux.setsockopt(jvmStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
+    _ = std.os.linux.setsockopt(proxyStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
+
     try proxy(jvmStream.handle, proxyStream.handle, proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, gpa);
 }

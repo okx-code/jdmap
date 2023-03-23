@@ -204,6 +204,7 @@ const Proxy = struct {
     commands: *std.AutoHashMapUnmanaged(u32, Command),
     classesObf: *std.AutoHashMapUnmanaged([MAX_SIZE]u8, []const u8), // class IDs to obfsucated class names
     fieldRequests: *std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8), // packet ID to reference type ID
+    methodRequests: *std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8), // packet ID to reference type ID
     fieldIDSize: u8 = 0,
     methodIDSize: u8 = 0,
     objectIDSize: u8 = 0,
@@ -229,12 +230,15 @@ pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyRead
     }
     var fieldRequests = std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8){};
     defer fieldRequests.deinit(allocator);
+    var methodRequests = std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8){};
+    defer methodRequests.deinit(allocator);
     var ctx: Proxy = .{
         .allocator = allocator,
         .commands = &map,
         .mappings = mappings,
         .options = options,
         .fieldRequests = &fieldRequests,
+        .methodRequests = &methodRequests,
         .classesObf = &classesObf,
     };
 
@@ -253,35 +257,47 @@ pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyRead
     try std.os.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, proxyStream, &proxyIn);
 
     var events: [10]std.os.linux.epoll_event = undefined;
+    var writeBuffer = std.ArrayListUnmanaged(u8){};
+    defer writeBuffer.deinit(ctx.allocator);
     while (true) {
         var eventCount = std.os.epoll_wait(epfd, &events, -1);
 
         var i: u32 = 0;
-        var writeBuffer = std.ArrayListUnmanaged(u8){};
-        defer writeBuffer.deinit(ctx.allocator);
         while (i < eventCount) : (i += 1) {
             if (events[i].data.fd == jvmStream) {
-                receiveCommandOrReply(&ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
-                    switch (e) {
-                        error.EndOfStream => {
-                            std.debug.print("connection to jvm lost\n", .{});
-                            return;
-                        },
-                        else => return e,
-                    }
-                };
-                writeBuffer.clearRetainingCapacity();
+                if (false) {
+                    var b: u8 = try jvmReader.readIntBig(u8);
+                    try proxyWriter.writeIntBig(u8, b);
+                }
+                if (true) {
+                    receiveCommandOrReply(&ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
+                        switch (e) {
+                            error.EndOfStream => {
+                                std.debug.print("connection to jvm lost\n", .{});
+                                return;
+                            },
+                            else => return e,
+                        }
+                    };
+                    writeBuffer.clearRetainingCapacity();
+                }
             } else if (events[i].data.fd == proxyStream) {
-                forwardCommand(&ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
-                    switch (e) {
-                        error.EndOfStream => {
-                            std.debug.print("connection to proxy lost\n", .{});
-                            return;
-                        },
-                        else => return e,
-                    }
-                };
-                writeBuffer.clearRetainingCapacity();
+                if (false) {
+                    var b: u8 = try proxyReader.readIntBig(u8);
+                    try jvmWriter.writeIntBig(u8, b);
+                }
+                if (true) {
+                    forwardCommand(&ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
+                        switch (e) {
+                            error.EndOfStream => {
+                                std.debug.print("connection to proxy lost\n", .{});
+                                return;
+                            },
+                            else => return e,
+                        }
+                    };
+                    writeBuffer.clearRetainingCapacity();
+                }
             }
         }
     }
@@ -314,7 +330,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
     try bufferWriter.writeIntBig(u8, flags);
 
     if (ctx.options.verbose) {
-        //std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
+        std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
     }
 
     var dataSize: usize = length - 11;
@@ -367,7 +383,6 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         ctx.frameIDSize = @intCast(u8, frameIDSize);
                         break :inner true;
                     },
-                    // TODO Handle .AllClasses as well, although this is not called by IntelliJ
                     .AllClassesWithGeneric, .AllClasses => inner: {
                         const classCount = try jvmReader.readIntBig(u32);
                         try bufferWriter.writeIntBig(u32, classCount);
@@ -424,65 +439,23 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         var maxFieldBuf: [MAX_SIZE]u8 = undefined;
                         var fieldBuf = maxFieldBuf[0..ctx.fieldIDSize];
 
-                        const declaredFields: u32 = try jvmReader.readIntBig(u32);
-                        try bufferWriter.writeIntBig(u32, declaredFields);
+                        try remap(ctx, jvmReader, bufferWriter, fieldBuf, classRef.?, ctx.mappings.spigotToSpigotFieldsToMojMapFields);
 
-                        var string = std.ArrayListUnmanaged(u8){};
-                        defer string.deinit(ctx.allocator);
-
-                        var fieldIndex: u32 = 0;
-
-                        while (fieldIndex < declaredFields) : (fieldIndex += 1) {
-                            try jvmReader.readNoEof(fieldBuf);
-                            try bufferWriter.writeAll(fieldBuf);
-
-                            const nameStringLen: u32 = try jvmReader.readIntBig(u32);
-                            try string.ensureTotalCapacity(ctx.allocator, nameStringLen);
-                            string.expandToCapacity();
-                            try jvmReader.readNoEof(string.items[0..nameStringLen]);
-                            if (ctx.options.verbose) {
-                                std.debug.print("name: {s}\n", .{string.items[0..nameStringLen]});
-                            }
-
-                            var name: []const u8 = string.items[0..nameStringLen];
-
-                            const classNameOpt = ctx.classesObf.get(classRef.?);
-                            if (classNameOpt) |className| {
-                                const fieldsOpt = ctx.mappings.spigotToSpigotFieldsToMojMapFields.get(className);
-                                if (fieldsOpt) |fields| {
-                                    if (fields.get(name)) |fieldName| {
-                                        if (ctx.options.verbose) {
-                                            std.debug.print("verbose: remap field {s} {s} -> {s}\n", .{ className, name, fieldName });
-                                        }
-                                        name = fieldName;
-                                    }
-                                }
-                            }
-
-                            //try bufferWriter.writeIntBig(u32, nameStringLen);
-                            //try bufferWriter.writeAll(string.items[0..nameStringLen]);
-                            try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
-                            try bufferWriter.writeAll(name);
-
-                            const signatureLen: u32 = try jvmReader.readIntBig(u32);
-                            try string.ensureTotalCapacity(ctx.allocator, signatureLen);
-                            string.expandToCapacity();
-                            try jvmReader.readNoEof(string.items[0..signatureLen]);
-                            try bufferWriter.writeIntBig(u32, signatureLen);
-                            try bufferWriter.writeAll(string.items[0..signatureLen]);
-
-                            const genericSignatureLen: u32 = try jvmReader.readIntBig(u32);
-                            try string.ensureTotalCapacity(ctx.allocator, genericSignatureLen);
-                            string.expandToCapacity();
-                            try jvmReader.readNoEof(string.items[0..genericSignatureLen]);
-                            try bufferWriter.writeIntBig(u32, genericSignatureLen);
-                            try bufferWriter.writeAll(string.items[0..genericSignatureLen]);
-
-                            const modBits: u32 = try jvmReader.readIntBig(u32);
-                            try bufferWriter.writeIntBig(u32, modBits);
-                        }
                         break :inner true;
                     },
+                    //                    .MethodsWithGeneric => inner: {
+                    //                        const classRef = ctx.methodRequests.get(id);
+                    //                        if (classRef == null) {
+                    //                            return ProxyError.InvalidProxy;
+                    //                        }
+                    //
+                    //                        var maxMethodBuf: [MAX_SIZE]u8 = undefined;
+                    //                        var methodBuf = maxMethodBuf[0..ctx.methodIDSize];
+                    //
+                    //                        //try remap(ctx, jvmReader, bufferWriter, methodBuf, classRef.?);
+                    //
+                    //                        break :inner true;
+                    //                    },
                     else => false,
                 };
             },
@@ -697,9 +670,17 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                         try bufferWriter.writeAll(refBuf);
 
                         try ctx.fieldRequests.put(ctx.allocator, id, maxRefBuf);
-                        // todo note the reference type id to help with the reply
                         break :inner true;
                     },
+                    //                    .MethodsWithGeneric => inner: {
+                    //                        var maxRefBuf: [MAX_SIZE]u8 = [_]u8{0} ** MAX_SIZE;
+                    //                        var refBuf = maxRefBuf[0..ctx.referenceTypeIDSize];
+                    //                        try proxyReader.readNoEof(refBuf);
+                    //                        try bufferWriter.writeAll(refBuf);
+                    //
+                    //                        try ctx.methodRequests.put(ctx.allocator, id, maxRefBuf);
+                    //                        break :inner true;
+                    //                    },
                     else => false,
                 };
             },
@@ -707,9 +688,6 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
         }) {
             while (dataSize > 0) {
                 const read = try proxyReader.read(buf[0..@min(dataSize, buf.len)]);
-                //if (commandSet == 15 and command == 1) {
-                //   std.debug.print("{s}\n{any}", .{ buf[0..read], buf[0..read] });
-                //}
                 try bufferWriter.writeAll(buf[0..read]);
                 dataSize -= read;
             }
@@ -780,6 +758,64 @@ fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class:
 
     try proxyWriter.writeIntBig(u32, @intCast(u32, out.getPos() catch unreachable));
     try proxyWriter.writeAll(out.getWritten());
+}
+
+fn remap(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8, classRef: [MAX_SIZE]u8, map: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8))) !void {
+    const declaredFields: u32 = try jvmReader.readIntBig(u32);
+    try bufferWriter.writeIntBig(u32, declaredFields);
+
+    var string = std.ArrayListUnmanaged(u8){};
+    defer string.deinit(ctx.allocator);
+
+    var index: u32 = 0;
+
+    while (index < declaredFields) : (index += 1) {
+        try jvmReader.readNoEof(buf);
+        try bufferWriter.writeAll(buf);
+
+        const nameStringLen: u32 = try jvmReader.readIntBig(u32);
+        try string.ensureTotalCapacity(ctx.allocator, nameStringLen);
+        string.expandToCapacity();
+        try jvmReader.readNoEof(string.items[0..nameStringLen]);
+        if (ctx.options.verbose) {
+            std.debug.print("name: {s}\n", .{string.items[0..nameStringLen]});
+        }
+
+        var name: []const u8 = string.items[0..nameStringLen];
+
+        const classNameOpt = ctx.classesObf.get(classRef);
+        if (classNameOpt) |className| {
+            const fieldsOpt = map.get(className);
+            if (fieldsOpt) |fields| {
+                if (fields.get(name)) |fieldName| {
+                    if (ctx.options.verbose) {
+                        std.debug.print("verbose: Remap field {s} {s} -> {s}\n", .{ className, name, fieldName });
+                    }
+                    name = fieldName;
+                }
+            }
+        }
+
+        try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
+        try bufferWriter.writeAll(name);
+
+        const signatureLen: u32 = try jvmReader.readIntBig(u32);
+        try string.ensureTotalCapacity(ctx.allocator, signatureLen);
+        string.expandToCapacity();
+        try jvmReader.readNoEof(string.items[0..signatureLen]);
+        try bufferWriter.writeIntBig(u32, signatureLen);
+        try bufferWriter.writeAll(string.items[0..signatureLen]);
+
+        const genericSignatureLen: u32 = try jvmReader.readIntBig(u32);
+        try string.ensureTotalCapacity(ctx.allocator, genericSignatureLen);
+        string.expandToCapacity();
+        try jvmReader.readNoEof(string.items[0..genericSignatureLen]);
+        try bufferWriter.writeIntBig(u32, genericSignatureLen);
+        try bufferWriter.writeAll(string.items[0..genericSignatureLen]);
+
+        const modBits: u32 = try jvmReader.readIntBig(u32);
+        try bufferWriter.writeIntBig(u32, modBits);
+    }
 }
 
 fn toCommand(commandSet: u8, command: u8, enumType: *[:0]const u8) ?Command {

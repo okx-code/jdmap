@@ -7,7 +7,8 @@ pub const Mappings = struct {
     mojMapToSpigot: std.StringHashMapUnmanaged([]const u8),
 
     spigotToSpigotFieldsToMojMapFields: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
-    mojMapToMojMapFieldsToSpigotFields: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
+
+    spigotToSpigotMethodsToMojMapMethods: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
 
     pub fn deinit(self: *Mappings, allocator: std.mem.Allocator) void {
         self.spigotToMojMap.deinit(allocator);
@@ -17,11 +18,11 @@ pub const Mappings = struct {
             entry.value_ptr.deinit(allocator);
         }
         self.spigotToSpigotFieldsToMojMapFields.deinit(allocator);
-        var itMojMap = self.mojMapToMojMapFieldsToSpigotFields.iterator();
+        var itMojMap = self.spigotToSpigotMethodsToMojMapMethods.iterator();
         while (itMojMap.next()) |entry| {
             entry.value_ptr.deinit(allocator);
         }
-        self.mojMapToMojMapFieldsToSpigotFields.deinit(allocator);
+        self.spigotToSpigotMethodsToMojMapMethods.deinit(allocator);
     }
 
     pub fn parseMappings(text: []const u8, allocator: std.mem.Allocator) !Mappings {
@@ -29,7 +30,7 @@ pub const Mappings = struct {
             .spigotToMojMap = std.StringHashMapUnmanaged([]const u8){},
             .mojMapToSpigot = std.StringHashMapUnmanaged([]const u8){},
             .spigotToSpigotFieldsToMojMapFields = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)){},
-            .mojMapToMojMapFieldsToSpigotFields = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)){},
+            .spigotToSpigotMethodsToMojMapMethods = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)){},
         };
         errdefer mappings.deinit(allocator);
 
@@ -77,12 +78,23 @@ pub const Mappings = struct {
                         spigotResult.value_ptr.* = std.StringHashMapUnmanaged([]const u8){};
                     }
                     try spigotResult.value_ptr.put(allocator, spigotSlice, mojSlice);
+                } else if (classType == 'm') {
+                    try expect(reader, '\t');
+                    // skip type
+                    try readTo(reader, '\t');
 
-                    const mojResult = try mappings.mojMapToMojMapFieldsToSpigotFields.getOrPut(allocator, lastMojMapSlice.?);
-                    if (!mojResult.found_existing) {
-                        mojResult.value_ptr.* = std.StringHashMapUnmanaged([]const u8){};
+                    const mojClassStart = stream.getPos() catch return error.ParseError;
+                    try readTo(reader, '\t');
+                    const spigotSliceStart = stream.getPos() catch return error.ParseError;
+                    const mojSlice = text[mojClassStart .. spigotSliceStart - 1];
+                    try readTo(reader, '\n');
+                    const spigotSlice = text[spigotSliceStart .. (stream.getPos() catch return error.ParseError) - 1];
+
+                    const spigotResult = try mappings.spigotToSpigotMethodsToMojMapMethods.getOrPut(allocator, lastSpigotSlice.?);
+                    if (!spigotResult.found_existing) {
+                        spigotResult.value_ptr.* = std.StringHashMapUnmanaged([]const u8){};
                     }
-                    try mojResult.value_ptr.put(allocator, mojSlice, spigotSlice);
+                    try spigotResult.value_ptr.put(allocator, spigotSlice, mojSlice);
                 } else {
                     // skip methods
                     try readTo(reader, '\n');
