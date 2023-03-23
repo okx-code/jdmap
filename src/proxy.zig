@@ -330,7 +330,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
     try bufferWriter.writeIntBig(u8, flags);
 
     if (ctx.options.verbose) {
-        std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
+        //std.debug.print("verbose: recv <- jvm {d} {d} {d}\n", .{ length, id, flags });
     }
 
     var dataSize: usize = length - 11;
@@ -439,23 +439,23 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         var maxFieldBuf: [MAX_SIZE]u8 = undefined;
                         var fieldBuf = maxFieldBuf[0..ctx.fieldIDSize];
 
-                        try remap(ctx, jvmReader, bufferWriter, fieldBuf, classRef.?, ctx.mappings.spigotToSpigotFieldsToMojMapFields);
+                        try remapFields(ctx, jvmReader, bufferWriter, fieldBuf, classRef.?);
 
                         break :inner true;
                     },
-                    //                    .MethodsWithGeneric => inner: {
-                    //                        const classRef = ctx.methodRequests.get(id);
-                    //                        if (classRef == null) {
-                    //                            return ProxyError.InvalidProxy;
-                    //                        }
-                    //
-                    //                        var maxMethodBuf: [MAX_SIZE]u8 = undefined;
-                    //                        var methodBuf = maxMethodBuf[0..ctx.methodIDSize];
-                    //
-                    //                        //try remap(ctx, jvmReader, bufferWriter, methodBuf, classRef.?);
-                    //
-                    //                        break :inner true;
-                    //                    },
+                    .MethodsWithGeneric => inner: {
+                        const classRef = ctx.methodRequests.get(id);
+                        if (classRef == null) {
+                            return ProxyError.InvalidProxy;
+                        }
+
+                        var maxMethodBuf: [MAX_SIZE]u8 = undefined;
+                        var methodBuf = maxMethodBuf[0..ctx.methodIDSize];
+
+                        try remapMethods(ctx, jvmReader, bufferWriter, methodBuf, classRef.?);
+
+                        break :inner true;
+                    },
                     else => false,
                 };
             },
@@ -672,15 +672,15 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                         try ctx.fieldRequests.put(ctx.allocator, id, maxRefBuf);
                         break :inner true;
                     },
-                    //                    .MethodsWithGeneric => inner: {
-                    //                        var maxRefBuf: [MAX_SIZE]u8 = [_]u8{0} ** MAX_SIZE;
-                    //                        var refBuf = maxRefBuf[0..ctx.referenceTypeIDSize];
-                    //                        try proxyReader.readNoEof(refBuf);
-                    //                        try bufferWriter.writeAll(refBuf);
-                    //
-                    //                        try ctx.methodRequests.put(ctx.allocator, id, maxRefBuf);
-                    //                        break :inner true;
-                    //                    },
+                    .MethodsWithGeneric => inner: {
+                        var maxRefBuf: [MAX_SIZE]u8 = [_]u8{0} ** MAX_SIZE;
+                        var refBuf = maxRefBuf[0..ctx.referenceTypeIDSize];
+                        try proxyReader.readNoEof(refBuf);
+                        try bufferWriter.writeAll(refBuf);
+
+                        try ctx.methodRequests.put(ctx.allocator, id, maxRefBuf);
+                        break :inner true;
+                    },
                     else => false,
                 };
             },
@@ -699,12 +699,61 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
 }
 
 fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8), options: *Options, refBuf: [MAX_SIZE]u8, classesObf: *std.AutoHashMapUnmanaged([MAX_SIZE]u8, []const u8)) !void {
-    var buf: [1024]u8 = undefined;
-    var buf2: [512]u8 = undefined;
-    var out = std.io.fixedBufferStream(&buf);
-    const writer = out.writer();
+    var classPtr: ?[]const u8 = null;
+    var newSignature = try remapSignature(allocator, options.remapKeys, options.remapValues, spigotToMojMap, class, &classPtr, null);
+    defer allocator.free(newSignature);
+    if (classPtr) |classValue| {
+        try classesObf.put(allocator, refBuf, try allocator.dupe(u8, classValue));
+    }
 
-    var stream = std.io.fixedBufferStream(class);
+    try proxyWriter.writeIntBig(u32, @intCast(u32, newSignature.len));
+    try proxyWriter.writeAll(newSignature);
+}
+
+fn remapAndWriteMethodSignature(allocator: std.mem.Allocator, signature: []const u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8), options: *Options) ![]u8 {
+    if (signature[0] != '(') {
+        return ProxyError.InvalidProxy;
+    }
+
+    var newMethodSignature = try std.ArrayListUnmanaged(u8).initCapacity(allocator, 64);
+    errdefer newMethodSignature.deinit(allocator);
+
+    var writer = newMethodSignature.writer(allocator);
+    try writer.writeByte('(');
+
+    const closingBrace = std.mem.indexOfScalarPos(u8, signature, 1, ')') orelse return ProxyError.InvalidProxy;
+
+    if (closingBrace > 1) {
+        var pos: u64 = 1;
+        while (pos < closingBrace) {
+            var posAdd: u64 = 0;
+            const newSignature = try remapSignature(allocator, options.remapKeys, options.remapValues, spigotToMojMap, signature[pos..closingBrace], null, &posAdd);
+            pos += posAdd;
+            defer allocator.free(newSignature);
+            try writer.writeAll(newSignature);
+        }
+    }
+
+    try writer.writeByte(')');
+
+    if (signature[closingBrace + 1] == 'V') {
+        try writer.writeByte('V');
+    } else {
+        const newSignature = try remapSignature(allocator, options.remapKeys, options.remapValues, spigotToMojMap, signature[closingBrace + 1 .. signature.len], null, null);
+        defer allocator.free(newSignature);
+        try writer.writeAll(newSignature);
+    }
+
+    return try newMethodSignature.toOwnedSlice(allocator);
+}
+
+fn remapSignature(allocator: std.mem.Allocator, remapKeys: [][]u8, remapValues: [][]u8, spigotToMojMap: *std.StringHashMapUnmanaged([]const u8), signature: []const u8, class: ?*?[]const u8, endPos: ?*u64) ![]u8 {
+    var newSignature = try std.ArrayListUnmanaged(u8).initCapacity(allocator, 64);
+    errdefer newSignature.deinit(allocator);
+
+    const writer = newSignature.writer(allocator);
+
+    var stream = std.io.fixedBufferStream(signature);
     const reader = stream.reader();
     var byte = try reader.readByte();
     while (byte == '[') { // pass through array
@@ -726,24 +775,34 @@ fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class:
             }
 
             const end = (stream.getPos() catch unreachable) - 1;
-            var className = class[start..end];
+            var className = signature[start..end];
 
             var remapped = spigotToMojMap.get(className);
+            var free = false;
+            defer {
+                if (free) {
+                    allocator.free(remapped.?);
+                }
+            }
             if (remapped == null) {
-                for (options.remapValues, 0..) |remapKey, rIndex| {
+                for (remapValues, 0..) |remapKey, rIndex| {
                     if (std.mem.startsWith(u8, className, remapKey)) {
-                        const value = options.remapKeys[rIndex];
+                        const value = remapKeys[rIndex];
                         if (className.len + value.len > 512) {
                             return ProxyError.InvalidProxy;
                         }
-                        std.mem.copy(u8, buf2[0..512], value);
-                        std.mem.copy(u8, buf2[value.len..512], className[remapKey.len..]);
-                        remapped = buf2[0 .. className.len - remapKey.len + value.len];
+
+                        remapped = try std.mem.replaceOwned(u8, allocator, className, remapKey, value);
+                        free = true;
+
+                        //std.mem.copy(u8, buf2[0..512], value);
+                        //std.mem.copy(u8, buf2[value.len..512], className[remapKey.len..]);
+                        //remapped = buf2[0 .. className.len - remapKey.len + value.len];
                         break;
                     }
                 }
-            } else {
-                try classesObf.put(allocator, refBuf, try allocator.dupe(u8, className));
+            } else if (class) |classPtr| {
+                classPtr.* = className;
             }
             if (remapped != null) {
                 try writer.writeAll(remapped.?);
@@ -756,11 +815,13 @@ fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class:
         else => return ProxyError.InvalidProxy,
     }
 
-    try proxyWriter.writeIntBig(u32, @intCast(u32, out.getPos() catch unreachable));
-    try proxyWriter.writeAll(out.getWritten());
+    if (endPos) |endPtr| {
+        endPtr.* = stream.getPos() catch unreachable;
+    }
+    return try newSignature.toOwnedSlice(allocator);
 }
 
-fn remap(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8, classRef: [MAX_SIZE]u8, map: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8))) !void {
+fn remapFields(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8, classRef: [MAX_SIZE]u8) !void {
     const declaredFields: u32 = try jvmReader.readIntBig(u32);
     try bufferWriter.writeIntBig(u32, declaredFields);
 
@@ -777,15 +838,12 @@ fn remap(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8, clas
         try string.ensureTotalCapacity(ctx.allocator, nameStringLen);
         string.expandToCapacity();
         try jvmReader.readNoEof(string.items[0..nameStringLen]);
-        if (ctx.options.verbose) {
-            std.debug.print("name: {s}\n", .{string.items[0..nameStringLen]});
-        }
 
         var name: []const u8 = string.items[0..nameStringLen];
 
         const classNameOpt = ctx.classesObf.get(classRef);
         if (classNameOpt) |className| {
-            const fieldsOpt = map.get(className);
+            const fieldsOpt = ctx.mappings.spigotToSpigotFieldsToMojMapFields.get(className);
             if (fieldsOpt) |fields| {
                 if (fields.get(name)) |fieldName| {
                     if (ctx.options.verbose) {
@@ -799,12 +857,75 @@ fn remap(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8, clas
         try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
         try bufferWriter.writeAll(name);
 
+        // TODO remap signature
         const signatureLen: u32 = try jvmReader.readIntBig(u32);
         try string.ensureTotalCapacity(ctx.allocator, signatureLen);
         string.expandToCapacity();
         try jvmReader.readNoEof(string.items[0..signatureLen]);
+        if (ctx.options.verbose) {
+            std.debug.print("signature: {s}\n", .{string.items[0..signatureLen]});
+        }
         try bufferWriter.writeIntBig(u32, signatureLen);
         try bufferWriter.writeAll(string.items[0..signatureLen]);
+
+        const genericSignatureLen: u32 = try jvmReader.readIntBig(u32);
+        try string.ensureTotalCapacity(ctx.allocator, genericSignatureLen);
+        string.expandToCapacity();
+        try jvmReader.readNoEof(string.items[0..genericSignatureLen]);
+        try bufferWriter.writeIntBig(u32, genericSignatureLen);
+        try bufferWriter.writeAll(string.items[0..genericSignatureLen]);
+
+        const modBits: u32 = try jvmReader.readIntBig(u32);
+        try bufferWriter.writeIntBig(u32, modBits);
+    }
+}
+
+fn remapMethods(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8, classRef: [MAX_SIZE]u8) !void {
+    const declaredFields: u32 = try jvmReader.readIntBig(u32);
+    try bufferWriter.writeIntBig(u32, declaredFields);
+
+    var string = std.ArrayListUnmanaged(u8){};
+    defer string.deinit(ctx.allocator);
+
+    var index: u32 = 0;
+
+    while (index < declaredFields) : (index += 1) {
+        try jvmReader.readNoEof(buf);
+        try bufferWriter.writeAll(buf);
+
+        const nameStringLen: u32 = try jvmReader.readIntBig(u32);
+        try string.ensureTotalCapacity(ctx.allocator, nameStringLen);
+        string.expandToCapacity();
+        try jvmReader.readNoEof(string.items[0..nameStringLen]);
+
+        const signatureLen: u32 = try jvmReader.readIntBig(u32);
+        var signatureStr = try std.ArrayListUnmanaged(u8).initCapacity(ctx.allocator, signatureLen);
+        defer signatureStr.deinit(ctx.allocator);
+        try jvmReader.readNoEof(signatureStr.unusedCapacitySlice()[0..signatureLen]);
+        signatureStr.items.len = signatureLen;
+
+        var name: []const u8 = string.items[0..nameStringLen];
+
+        if (ctx.classesObf.get(classRef)) |className| {
+            if (ctx.mappings.spigotToSpigotMethodsToMojMapMethods.get(className)) |methods| {
+                const signatureRemapped: []u8 = try remapAndWriteMethodSignature(ctx.allocator, signatureStr.items, &ctx.mappings.spigotToMojMap, ctx.options);
+                defer ctx.allocator.free(signatureRemapped);
+                if (methods.get(.{ .signature = signatureRemapped, .name = name })) |fieldName| {
+                    if (ctx.options.verbose) {
+                        std.debug.print("verbose: Remap method {s} {s} -> {s} {s}\n", .{ className, name, signatureStr.items, fieldName });
+                    }
+                    name = fieldName;
+                    signatureStr.clearRetainingCapacity();
+                    try signatureStr.appendSlice(ctx.allocator, signatureRemapped);
+                }
+            }
+        }
+
+        try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
+        try bufferWriter.writeAll(name);
+
+        try bufferWriter.writeIntBig(u32, @intCast(u32, signatureStr.items.len));
+        try bufferWriter.writeAll(signatureStr.items);
 
         const genericSignatureLen: u32 = try jvmReader.readIntBig(u32);
         try string.ensureTotalCapacity(ctx.allocator, genericSignatureLen);
