@@ -23,6 +23,7 @@ Example: jdmap -v -r 'org/bukkit/craftbukkit:org/bukkit/craftbukkit/v1_19_R1' 50
 
 Options:
   -r, --remap      Separated by a colon, remap the first package on the proxy to the second package on the JVM.
+  -s, --restart    Automatically restart the proxy if the connection is terminated.
   -v, --verbose    Output details of packets sent and received.
 ```
 

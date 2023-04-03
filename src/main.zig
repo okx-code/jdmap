@@ -73,22 +73,28 @@ pub fn main() anyerror!void {
 
     try proxyServer.listen(proxyAddress);
 
-    const connection = try proxyServer.accept();
-    const proxyStream = connection.stream;
-    errdefer proxyStream.close();
-    const proxyReader = proxyStream.reader();
-    const proxyWriter = proxyStream.writer();
+    while (true) {
+        const connection = try proxyServer.accept();
+        const proxyStream = connection.stream;
+        errdefer proxyStream.close();
+        const proxyReader = proxyStream.reader();
+        const proxyWriter = proxyStream.writer();
 
-    stderr.print("connecting to jvm\n", .{}) catch {};
+        stderr.print("connecting to jvm\n", .{}) catch {};
 
-    const jvmStream = try std.net.tcpConnectToAddress(jvmAddress);
-    errdefer jvmStream.close();
-    const jvmReader = jvmStream.reader();
-    const jvmWriter = jvmStream.writer();
+        const jvmStream = try std.net.tcpConnectToAddress(jvmAddress);
+        errdefer jvmStream.close();
+        const jvmReader = jvmStream.reader();
+        const jvmWriter = jvmStream.writer();
 
-    var val: i32 = 1;
-    _ = std.os.linux.setsockopt(jvmStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
-    _ = std.os.linux.setsockopt(proxyStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
+        var val: i32 = 1;
+        _ = std.os.linux.setsockopt(jvmStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
+        _ = std.os.linux.setsockopt(proxyStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
 
-    try proxy(jvmStream.handle, proxyStream.handle, proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, gpa);
+        try proxy(jvmStream.handle, proxyStream.handle, proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, gpa);
+
+        if (!opts.?.restart) {
+            break;
+        }
+    }
 }

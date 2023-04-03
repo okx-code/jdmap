@@ -10,7 +10,7 @@ pub const USAGE =
     \\
     \\Options:
     \\  -r, --remap      Separated by a colon, remap the first package on the proxy to the second package on the JVM.
-    //\\  -s, --restart    Automatically restart the proxy if the connection is terminated.
+    \\  -s, --restart    Automatically restart the proxy if the connection is terminated.
     //\\  -x, --exclude    Do not remap the given class(es), overrides other options. May use the * character.
     \\  -v, --verbose    Output details of packets sent and received.
     \\
@@ -18,6 +18,7 @@ pub const USAGE =
 
 pub const Options = struct {
     verbose: bool = false,
+    restart: bool = false,
     remapKeys: [][]u8 = undefined,
     remapValues: [][]u8 = undefined,
     exclude: [][]u8 = undefined,
@@ -40,6 +41,8 @@ pub const Options = struct {
                 break;
             } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
                 options.verbose = true;
+            } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--restart")) {
+                options.restart = true;
             } else if (std.mem.eql(u8, arg, "-x") or std.mem.eql(u8, arg, "--exclude")) {
                 var exclude = next(args, &index);
                 if (exclude == null) {
