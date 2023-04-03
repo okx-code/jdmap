@@ -28,6 +28,8 @@ Options:
 
 The `jvm port` is the port of the JVM which a debugger can connect to. The `proxy port` is the port that the remapper proxy will listen for and wait for a debugger to connect to. The `mappings file` is the file used for converting between Spigot and Mojang mappings. It can be found on a server in (for example) `versions/1.18.2/paper-1.18.2.jar` in `META-INF/mappings` under the name `reobf.tiny`, and starts with `tiny    2       0       mojang+yarn     spigot`.
 
-### Development
+## Building
 
-This project is in a very early stage of development and only translates class names and allows you to place breakpoints. It does not translate method names yet, and there is very little configuration. Expect things to not work perfectly.
+This project is made for Linux and uses several Linux features that are not available on other systems (epoll and mmap). To compile this project, download the Zig binary according to the version in the `.zig-version` file at: https://ziglang.org/download/ such as https://ziglang.org/builds/zig-linux-x86_64-0.11.0-dev.2371+a31450375.tar.xz
+
+The zig binary contained can be used to compile. Run `zig build -Doptimize=ReleaseSafe` to compile. The binary is placed in `zig-out/bin`.
