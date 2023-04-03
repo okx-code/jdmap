@@ -43,14 +43,16 @@ pub fn main() anyerror!void {
 
     const start: i64 = std.time.milliTimestamp();
 
-    var mappingsText: []u8 = blk: {
-        // open read only
-        const mappingsFile = try std.fs.cwd().openFile(programArgs[2], .{});
-        defer mappingsFile.close();
+    var mappingsText: []align(4096) const u8 = undefined;
 
-        break :blk try mappingsFile.readToEndAlloc(gpa, std.math.maxInt(usize));
-    };
-    defer gpa.free(mappingsText);
+    const mappingsFile = try std.fs.cwd().openFile(programArgs[2], .{});
+    defer mappingsFile.close();
+
+    const stat = try std.os.fstat(mappingsFile.handle);
+    mappingsText = try std.os.mmap(null, @intCast(usize, stat.size), std.os.linux.PROT.READ, std.os.linux.MAP.PRIVATE, mappingsFile.handle, 0);
+
+    defer std.os.munmap(mappingsText);
+
     // this does not copy strings and just points to the mappings text, so the lifetime needs to be managed carefully.
     var mappings = try Mappings.parseMappings(mappingsText, gpa);
     defer mappings.deinit(gpa);
@@ -63,8 +65,8 @@ pub fn main() anyerror!void {
 
     stderr.print("waiting for connection on port {d}\n", .{proxyPort}) catch {};
 
-    const jvmAddress = std.net.Address.resolveIp("127.0.0.1", jvmPort) catch unreachable;
-    const proxyAddress = std.net.Address.resolveIp("127.0.0.1", proxyPort) catch unreachable;
+    const jvmAddress = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, jvmPort);
+    const proxyAddress = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, proxyPort);
 
     var proxyServer = std.net.StreamServer.init(.{ .reuse_address = true });
     defer proxyServer.deinit();
