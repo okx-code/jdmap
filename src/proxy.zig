@@ -213,21 +213,13 @@ const Proxy = struct {
     terminate: bool = false,
 };
 
-const stderr = std.io.getStdErr().writer();
-
 pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyReader: anytype, proxyWriter: anytype, jvmReader: anytype, jvmWriter: anytype, mappings: *Mappings, options: *Options, closeables: anytype, allocator: std.mem.Allocator) !void {
     _ = closeables;
 
     var map = std.AutoHashMapUnmanaged(u32, Command){};
     defer map.deinit(allocator);
     var classesObf = std.AutoHashMapUnmanaged([MAX_SIZE]u8, []const u8){};
-    defer {
-        var it = classesObf.iterator();
-        while (it.next()) |kv| {
-            allocator.free(kv.value_ptr.*);
-        }
-        classesObf.deinit(allocator);
-    }
+    defer classesObf.deinit(allocator);
     var fieldRequests = std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8){};
     defer fieldRequests.deinit(allocator);
     var methodRequests = std.AutoHashMapUnmanaged(u32, [MAX_SIZE]u8){};
@@ -257,7 +249,7 @@ pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyRead
     try std.os.epoll_ctl(epfd, std.os.linux.EPOLL.CTL_ADD, proxyStream, &proxyIn);
 
     var events: [10]std.os.linux.epoll_event = undefined;
-    var writeBuffer = std.ArrayListUnmanaged(u8){};
+    var writeBuffer = try std.ArrayListUnmanaged(u8).initCapacity(ctx.allocator, 4096);
     defer writeBuffer.deinit(ctx.allocator);
     while (true) {
         var eventCount = std.os.epoll_wait(epfd, &events, -1);
@@ -265,37 +257,33 @@ pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyRead
         var i: u32 = 0;
         while (i < eventCount) : (i += 1) {
             if (events[i].data.fd == jvmStream) {
-                if (false) {
-                    var b: u8 = try jvmReader.readIntBig(u8);
-                    try proxyWriter.writeIntBig(u8, b);
-                }
-                if (true) {
-                    receiveCommandOrReply(&ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
-                        switch (e) {
-                            error.EndOfStream => {
-                                std.debug.print("connection to jvm lost\n", .{});
-                                return;
-                            },
-                            else => return e,
-                        }
-                    };
+                receiveCommandOrReply(&ctx, &writeBuffer, proxyWriter, jvmReader) catch |e| {
+                    switch (e) {
+                        error.EndOfStream => {
+                            std.debug.print("connection to jvm lost\n", .{});
+                            return;
+                        },
+                        else => return e,
+                    }
+                };
+                if (writeBuffer.capacity > 4096) {
+                    writeBuffer.clearAndFree(ctx.allocator);
+                } else {
                     writeBuffer.clearRetainingCapacity();
                 }
             } else if (events[i].data.fd == proxyStream) {
-                if (false) {
-                    var b: u8 = try proxyReader.readIntBig(u8);
-                    try jvmWriter.writeIntBig(u8, b);
-                }
-                if (true) {
-                    forwardCommand(&ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
-                        switch (e) {
-                            error.EndOfStream => {
-                                std.debug.print("connection to proxy lost\n", .{});
-                                return;
-                            },
-                            else => return e,
-                        }
-                    };
+                forwardCommand(&ctx, &writeBuffer, proxyReader, jvmWriter) catch |e| {
+                    switch (e) {
+                        error.EndOfStream => {
+                            std.debug.print("connection to proxy lost\n", .{});
+                            return;
+                        },
+                        else => return e,
+                    }
+                };
+                if (writeBuffer.capacity > 4096) {
+                    writeBuffer.clearAndFree(ctx.allocator);
+                } else {
                     writeBuffer.clearRetainingCapacity();
                 }
             }
@@ -435,6 +423,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         if (classRef == null) {
                             return ProxyError.InvalidProxy;
                         }
+                        _ = ctx.fieldRequests.remove(id);
 
                         var maxFieldBuf: [MAX_SIZE]u8 = undefined;
                         var fieldBuf = maxFieldBuf[0..ctx.fieldIDSize];
@@ -448,6 +437,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         if (classRef == null) {
                             return ProxyError.InvalidProxy;
                         }
+                        _ = ctx.methodRequests.remove(id);
 
                         var maxMethodBuf: [MAX_SIZE]u8 = undefined;
                         var methodBuf = maxMethodBuf[0..ctx.methodIDSize];
@@ -703,7 +693,7 @@ fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class:
     var newSignature = try remapSignature(allocator, options.remapKeys, options.remapValues, spigotToMojMap, class, &classPtr, null);
     defer allocator.free(newSignature);
     if (classPtr) |classValue| {
-        try classesObf.put(allocator, refBuf, try allocator.dupe(u8, classValue));
+        try classesObf.put(allocator, refBuf, classValue);
     }
 
     try proxyWriter.writeIntBig(u32, @intCast(u32, newSignature.len));
@@ -777,7 +767,14 @@ fn remapSignature(allocator: std.mem.Allocator, remapKeys: [][]u8, remapValues: 
             const end = (stream.getPos() catch unreachable) - 1;
             var className = signature[start..end];
 
-            var remapped = spigotToMojMap.get(className);
+            // Warning: Shenanigans to save on memory allocation by reusing the key
+            var remappedEntry = spigotToMojMap.getEntry(className);
+            var remapped: ?[]const u8 = undefined;
+            if (remappedEntry == null) {
+                remapped = null;
+            } else {
+                remapped = remappedEntry.?.value_ptr.*;
+            }
             var free = false;
             defer {
                 if (free) {
@@ -794,15 +791,11 @@ fn remapSignature(allocator: std.mem.Allocator, remapKeys: [][]u8, remapValues: 
 
                         remapped = try std.mem.replaceOwned(u8, allocator, className, remapKey, value);
                         free = true;
-
-                        //std.mem.copy(u8, buf2[0..512], value);
-                        //std.mem.copy(u8, buf2[value.len..512], className[remapKey.len..]);
-                        //remapped = buf2[0 .. className.len - remapKey.len + value.len];
                         break;
                     }
                 }
             } else if (class) |classPtr| {
-                classPtr.* = className;
+                classPtr.* = remappedEntry.?.key_ptr.*;
             }
             if (remapped != null) {
                 try writer.writeAll(remapped.?);
