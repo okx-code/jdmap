@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const TINY_CLASS_TYPE = 'c';
-
 pub const Mappings = struct {
     pub const Method = struct {
         signature: []const u8,
@@ -63,64 +61,90 @@ pub const Mappings = struct {
         var lastSpigotSlice: ?[]const u8 = null;
         var lastMojMapSlice: ?[]const u8 = null;
 
+        var startPos: ?usize = null;
+        var methods: u32 = 0;
+        var fields: u32 = 0;
         while (true) {
-            const mapType = reader.readByte() catch break; // don't error, just end of mappings
-            if (mapType == TINY_CLASS_TYPE) {
+            var mapType = reader.readByte() catch break; // don't error, just end of mappings
+            if (mapType == 'c') {
+                if (startPos != null) {
+                    if (fields > 0) {
+                        var map = std.StringHashMapUnmanaged([]const u8){};
+                        try map.ensureTotalCapacity(allocator, fields);
+                        try mappings.spigotToSpigotFieldsToMojMapFields.put(allocator, lastSpigotSlice.?, map);
+                    }
+                    if (methods > 0) {
+                        var map = Mappings.MethodHashMap{};
+                        try map.ensureTotalCapacity(allocator, methods);
+                        try mappings.spigotToSpigotMethodsToMojMapMethods.put(allocator, lastSpigotSlice.?, map);
+                    }
+                    stream.pos = startPos.?;
+                    startPos = null;
+                    continue;
+                }
+
                 try expect(reader, '\t');
-                const mojClassStart = stream.getPos() catch return error.ParseError;
+                const mojClassStart = stream.pos;
                 try readTo(reader, '\t');
-                const spigotSliceStart = stream.getPos() catch return error.ParseError;
+                const spigotSliceStart = stream.pos;
                 const mojSlice = text[mojClassStart .. spigotSliceStart - 1];
                 try readTo(reader, '\n');
-                const spigotSlice = text[spigotSliceStart .. (stream.getPos() catch return error.ParseError) - 1];
+                const spigotSlice = text[spigotSliceStart .. (stream.pos) - 1];
 
                 try mappings.spigotToMojMap.put(allocator, spigotSlice, mojSlice);
                 try mappings.mojMapToSpigot.put(allocator, mojSlice, spigotSlice);
 
                 lastSpigotSlice = spigotSlice;
                 lastMojMapSlice = mojSlice;
+
+                startPos = stream.pos;
+                methods = 0;
+                fields = 0;
             } else if (mapType == '\t' and lastSpigotSlice != null and lastMojMapSlice != null) {
                 const classType = reader.readByte() catch break;
-                if (classType == 'f') {
-                    try expect(reader, '\t');
-                    // skip type
-                    try readTo(reader, '\t');
-
-                    const mojClassStart = stream.getPos() catch return error.ParseError;
-                    try readTo(reader, '\t');
-                    const spigotSliceStart = stream.getPos() catch return error.ParseError;
-                    const mojSlice = text[mojClassStart .. spigotSliceStart - 1];
-                    try readTo(reader, '\n');
-                    const spigotSlice = text[spigotSliceStart .. (stream.getPos() catch return error.ParseError) - 1];
-
-                    const spigotResult = try mappings.spigotToSpigotFieldsToMojMapFields.getOrPut(allocator, lastSpigotSlice.?);
-                    if (!spigotResult.found_existing) {
-                        spigotResult.value_ptr.* = std.StringHashMapUnmanaged([]const u8){};
+                if (startPos != null) {
+                    if (classType == 'f') {
+                        fields += 1;
+                        try readTo(reader, '\n');
+                    } else if (classType == 'm') {
+                        methods += 1;
+                        try readTo(reader, '\n');
                     }
-                    try spigotResult.value_ptr.put(allocator, spigotSlice, mojSlice);
-                } else if (classType == 'm') {
-                    try expect(reader, '\t');
-                    const typeStart = stream.getPos() catch return error.ParseError;
-
-                    try readTo(reader, '\t');
-                    const mojClassStart = stream.getPos() catch return error.ParseError;
-                    const typeSlice = text[typeStart .. mojClassStart - 1];
-
-                    try readTo(reader, '\t');
-                    const spigotSliceStart = stream.getPos() catch return error.ParseError;
-                    const mojSlice = text[mojClassStart .. spigotSliceStart - 1];
-
-                    try readTo(reader, '\n');
-                    const spigotSlice = text[spigotSliceStart .. (stream.getPos() catch return error.ParseError) - 1];
-
-                    const spigotResult = try mappings.spigotToSpigotMethodsToMojMapMethods.getOrPut(allocator, lastSpigotSlice.?);
-                    if (!spigotResult.found_existing) {
-                        spigotResult.value_ptr.* = MethodHashMap{};
-                    }
-                    try spigotResult.value_ptr.put(allocator, .{ .signature = typeSlice, .name = spigotSlice }, mojSlice);
                 } else {
-                    // skip methods
-                    try readTo(reader, '\n');
+                    if (classType == 'f') {
+                        try expect(reader, '\t');
+                        // skip type
+                        try readTo(reader, '\t');
+
+                        const mojClassStart = stream.pos;
+                        try readTo(reader, '\t');
+                        const spigotSliceStart = stream.pos;
+                        const mojSlice = text[mojClassStart .. spigotSliceStart - 1];
+                        try readTo(reader, '\n');
+                        const spigotSlice = text[spigotSliceStart .. (stream.pos) - 1];
+
+                        var spigotResult = mappings.spigotToSpigotFieldsToMojMapFields.getPtr(lastSpigotSlice.?).?;
+                        spigotResult.putAssumeCapacity(spigotSlice, mojSlice);
+                    } else if (classType == 'm') {
+                        try expect(reader, '\t');
+                        const typeStart = stream.pos;
+
+                        try readTo(reader, '\t');
+                        const mojClassStart = stream.pos;
+                        const typeSlice = text[typeStart .. mojClassStart - 1];
+
+                        try readTo(reader, '\t');
+                        const spigotSliceStart = stream.pos;
+                        const mojSlice = text[mojClassStart .. spigotSliceStart - 1];
+
+                        try readTo(reader, '\n');
+                        const spigotSlice = text[spigotSliceStart .. (stream.pos) - 1];
+
+                        var spigotResult = mappings.spigotToSpigotMethodsToMojMapMethods.getPtr(lastSpigotSlice.?).?;
+                        spigotResult.putAssumeCapacity(.{ .signature = typeSlice, .name = spigotSlice }, mojSlice);
+                    } else {
+                        return error.ParseError;
+                    }
                 }
             } else {
                 try readTo(reader, '\n');
