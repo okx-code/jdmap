@@ -24,7 +24,7 @@ pub const Options = struct {
     exclude: [][]u8 = undefined,
     arguments: [][:0]u8 = undefined,
 
-    pub fn parse(args: [][:0]u8, allocator: std.mem.Allocator) ?Options {
+    pub fn parse(args: [][:0]u8, allocator: std.mem.Allocator) !?Options {
         var remapKeysList = std.ArrayListUnmanaged([]u8){};
         defer remapKeysList.deinit(allocator);
         var remapValuesList = std.ArrayListUnmanaged([]u8){};
@@ -69,8 +69,16 @@ pub const Options = struct {
                 const unmapped = remap.?[0..colon.?];
                 const remapped = remap.?[colon.? + 1 ..];
 
-                remapKeysList.append(allocator, unmapped) catch {};
-                remapValuesList.append(allocator, remapped) catch {};
+                try remapKeysList.append(allocator, unmapped);
+                try remapValuesList.append(allocator, remapped);
+            } else if (std.mem.eql(u8, arg, "-x") or std.mem.eql(u8, arg, "--exclude")) {
+                var class = next(args, &index);
+                if (class == null) {
+                    stderr.print("expected string after flag {s}\n", .{arg}) catch {};
+                    return null;
+                }
+
+                try excludeList.append(allocator, class.?);
             } else {
                 break;
             }

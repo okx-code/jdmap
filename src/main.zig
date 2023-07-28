@@ -18,7 +18,7 @@ pub fn main() anyerror!void {
         std.process.exit(1);
     }
 
-    var opts = options.Options.parse(args[1..], gpa);
+    var opts = try options.Options.parse(args[1..], gpa);
     if (opts == null) {
         // error message was already printed
         std.process.exit(1);
@@ -49,7 +49,7 @@ pub fn main() anyerror!void {
     defer mappingsFile.close();
 
     const stat = try std.os.fstat(mappingsFile.handle);
-    mappingsText = try std.os.mmap(null, @intCast(usize, stat.size), std.os.linux.PROT.READ, std.os.linux.MAP.PRIVATE, mappingsFile.handle, 0);
+    mappingsText = try std.os.mmap(null, @intCast(stat.size), std.os.linux.PROT.READ, std.os.linux.MAP.PRIVATE, mappingsFile.handle, 0);
 
     defer std.os.munmap(mappingsText);
 
@@ -76,7 +76,7 @@ pub fn main() anyerror!void {
     while (true) {
         const connection = try proxyServer.accept();
         const proxyStream = connection.stream;
-        errdefer proxyStream.close();
+        defer proxyStream.close();
         const proxyReader = proxyStream.reader();
         const proxyWriter = proxyStream.writer();
 
@@ -88,8 +88,8 @@ pub fn main() anyerror!void {
         const jvmWriter = jvmStream.writer();
 
         var val: i32 = 1;
-        _ = std.os.linux.setsockopt(jvmStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
-        _ = std.os.linux.setsockopt(proxyStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast([*]u8, &val), @sizeOf(i32));
+        _ = std.os.linux.setsockopt(jvmStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast(&val), @sizeOf(i32));
+        _ = std.os.linux.setsockopt(proxyStream.handle, std.os.linux.IPPROTO.TCP, std.os.linux.TCP.NODELAY, @ptrCast(&val), @sizeOf(i32));
 
         try proxy(jvmStream.handle, proxyStream.handle, proxyReader, proxyWriter, jvmReader, jvmWriter, &mappings, &opts.?, .{ &jvmStream, &proxyStream }, gpa);
 

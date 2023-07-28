@@ -251,6 +251,7 @@ pub fn proxy(jvmStream: std.os.socket_t, proxyStream: std.os.socket_t, proxyRead
     var events: [10]std.os.linux.epoll_event = undefined;
     var writeBuffer = try std.ArrayListUnmanaged(u8).initCapacity(ctx.allocator, 4096);
     defer writeBuffer.deinit(ctx.allocator);
+
     while (true) {
         var eventCount = std.os.epoll_wait(epfd, &events, -1);
 
@@ -364,11 +365,11 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
                         try bufferWriter.writeIntBig(u32, referenceTypeIDSize);
                         try bufferWriter.writeIntBig(u32, frameIDSize);
 
-                        ctx.fieldIDSize = @intCast(u8, fieldIDSize);
-                        ctx.methodIDSize = @intCast(u8, methodIDSize);
-                        ctx.objectIDSize = @intCast(u8, objectIDSize);
-                        ctx.referenceTypeIDSize = @intCast(u8, referenceTypeIDSize);
-                        ctx.frameIDSize = @intCast(u8, frameIDSize);
+                        ctx.fieldIDSize = @intCast(fieldIDSize);
+                        ctx.methodIDSize = @intCast(methodIDSize);
+                        ctx.objectIDSize = @intCast(objectIDSize);
+                        ctx.referenceTypeIDSize = @intCast(referenceTypeIDSize);
+                        ctx.frameIDSize = @intCast(frameIDSize);
                         break :inner true;
                     },
                     .AllClassesWithGeneric, .AllClasses => inner: {
@@ -475,7 +476,7 @@ fn receiveCommandOrReply(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), 
         }
     }
 
-    try proxyWriter.writeIntBig(u32, @intCast(u32, writeBuffer.items.len) + 4); // plus four for the length itself
+    try proxyWriter.writeIntBig(u32, @as(u32, @intCast(writeBuffer.items.len + 4))); // plus four for the length itself
     try proxyWriter.writeAll(writeBuffer.items);
 }
 
@@ -600,7 +601,7 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
                                     if (ctx.options.verbose) {
                                         std.debug.print("verbose: out remap {s} -> {s}\n", .{ buf[0..len], remappedReplacedString });
                                     }
-                                    try bufferWriter.writeIntBig(u32, @intCast(u32, remappedReplacedString.len));
+                                    try bufferWriter.writeIntBig(u32, @as(u32, @intCast(remappedReplacedString.len)));
                                     try bufferWriter.writeAll(remappedReplacedString);
                                 } else {
                                     try bufferWriter.writeIntBig(u32, len);
@@ -684,7 +685,7 @@ fn forwardCommand(ctx: *Proxy, writeBuffer: *std.ArrayListUnmanaged(u8), proxyRe
         }
     }
 
-    try jvmWriter.writeIntBig(u32, @intCast(u32, writeBuffer.items.len) + 4); // plus four for the length itself
+    try jvmWriter.writeIntBig(u32, @as(u32, @intCast(writeBuffer.items.len + 4))); // plus four for the length itself
     try jvmWriter.writeAll(writeBuffer.items);
 }
 
@@ -696,7 +697,7 @@ fn remapAndWriteClass(allocator: std.mem.Allocator, proxyWriter: anytype, class:
         try classesObf.put(allocator, refBuf, classValue);
     }
 
-    try proxyWriter.writeIntBig(u32, @intCast(u32, newSignature.len));
+    try proxyWriter.writeIntBig(u32, @as(u32, @intCast(newSignature.len)));
     try proxyWriter.writeAll(newSignature);
 }
 
@@ -847,7 +848,7 @@ fn remapFields(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u8
             }
         }
 
-        try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
+        try bufferWriter.writeIntBig(u32, @as(u32, @intCast(name.len)));
         try bufferWriter.writeAll(name);
 
         // TODO remap signature
@@ -914,10 +915,10 @@ fn remapMethods(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u
             }
         }
 
-        try bufferWriter.writeIntBig(u32, @intCast(u32, name.len));
+        try bufferWriter.writeIntBig(u32, @as(u32, @intCast(name.len)));
         try bufferWriter.writeAll(name);
 
-        try bufferWriter.writeIntBig(u32, @intCast(u32, signatureStr.items.len));
+        try bufferWriter.writeIntBig(u32, @as(u32, @intCast(signatureStr.items.len)));
         try bufferWriter.writeAll(signatureStr.items);
 
         const genericSignatureLen: u32 = try jvmReader.readIntBig(u32);
@@ -934,23 +935,23 @@ fn remapMethods(ctx: *Proxy, jvmReader: anytype, bufferWriter: anytype, buf: []u
 
 fn toCommand(commandSet: u8, command: u8, enumType: *[:0]const u8) ?Command {
     return switch (commandSet) {
-        @enumToInt(CommandSet.VirtualMachine) => createUnion("VirtualMachine", VirtualMachineCommands, command, enumType),
-        @enumToInt(CommandSet.ReferenceType) => createUnion("ReferenceType", ReferenceTypeCommands, command, enumType),
-        @enumToInt(CommandSet.ClassType) => createUnion("ClassType", ClassTypeCommands, command, enumType),
-        @enumToInt(CommandSet.ArrayType) => createUnion("ArrayType", ArrayTypeCommands, command, enumType),
-        @enumToInt(CommandSet.InterfaceType) => createUnion("InterfaceType", InterfaceTypeCommands, command, enumType),
-        @enumToInt(CommandSet.Method) => createUnion("Method", MethodCommands, command, enumType),
-        @enumToInt(CommandSet.ObjectReference) => createUnion("ObjectReference", ObjectReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.StringReference) => createUnion("StringReference", StringReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.ThreadReference) => createUnion("ThreadReference", ThreadReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.ThreadGroupReference) => createUnion("ThreadGroupReference", ThreadGroupReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.ArrayReference) => createUnion("ArrayReference", ArrayReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.ClassLoaderReference) => createUnion("ClassLoaderReference", ClassLoaderReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.EventRequest) => createUnion("EventRequest", EventRequestCommands, command, enumType),
-        @enumToInt(CommandSet.StackFrame) => createUnion("StackFrame", StackFrameCommands, command, enumType),
-        @enumToInt(CommandSet.ClassObjectReference) => createUnion("ClassObjectReference", ClassObjectReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.ModuleReference) => createUnion("ModuleReference", ModuleReferenceCommands, command, enumType),
-        @enumToInt(CommandSet.Event) => createUnion("Event", EventCommands, command, enumType),
+        @intFromEnum(CommandSet.VirtualMachine) => createUnion("VirtualMachine", VirtualMachineCommands, command, enumType),
+        @intFromEnum(CommandSet.ReferenceType) => createUnion("ReferenceType", ReferenceTypeCommands, command, enumType),
+        @intFromEnum(CommandSet.ClassType) => createUnion("ClassType", ClassTypeCommands, command, enumType),
+        @intFromEnum(CommandSet.ArrayType) => createUnion("ArrayType", ArrayTypeCommands, command, enumType),
+        @intFromEnum(CommandSet.InterfaceType) => createUnion("InterfaceType", InterfaceTypeCommands, command, enumType),
+        @intFromEnum(CommandSet.Method) => createUnion("Method", MethodCommands, command, enumType),
+        @intFromEnum(CommandSet.ObjectReference) => createUnion("ObjectReference", ObjectReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.StringReference) => createUnion("StringReference", StringReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.ThreadReference) => createUnion("ThreadReference", ThreadReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.ThreadGroupReference) => createUnion("ThreadGroupReference", ThreadGroupReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.ArrayReference) => createUnion("ArrayReference", ArrayReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.ClassLoaderReference) => createUnion("ClassLoaderReference", ClassLoaderReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.EventRequest) => createUnion("EventRequest", EventRequestCommands, command, enumType),
+        @intFromEnum(CommandSet.StackFrame) => createUnion("StackFrame", StackFrameCommands, command, enumType),
+        @intFromEnum(CommandSet.ClassObjectReference) => createUnion("ClassObjectReference", ClassObjectReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.ModuleReference) => createUnion("ModuleReference", ModuleReferenceCommands, command, enumType),
+        @intFromEnum(CommandSet.Event) => createUnion("Event", EventCommands, command, enumType),
         else => null,
     };
 }
@@ -958,8 +959,8 @@ fn toCommand(commandSet: u8, command: u8, enumType: *[:0]const u8) ?Command {
 fn createUnion(comptime name: []const u8, comptime enumType: type, commandValue: anytype, returnEnumType: *[:0]const u8) ?Command {
     inline for (@typeInfo(enumType).Enum.fields) |field| {
         if (field.value == commandValue) {
-            returnEnumType.* = @tagName(@intToEnum(enumType, commandValue));
-            return @unionInit(Command, name, @intToEnum(enumType, commandValue));
+            returnEnumType.* = @tagName(@as(enumType, @enumFromInt(commandValue)));
+            return @unionInit(Command, name, @as(enumType, @enumFromInt(commandValue)));
         }
     }
     return null;
