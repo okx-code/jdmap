@@ -71,14 +71,6 @@ pub const Options = struct {
 
                 try remapKeysList.append(allocator, unmapped);
                 try remapValuesList.append(allocator, remapped);
-            } else if (std.mem.eql(u8, arg, "-x") or std.mem.eql(u8, arg, "--exclude")) {
-                var class = next(args, &index);
-                if (class == null) {
-                    stderr.print("expected string after flag {s}\n", .{arg}) catch {};
-                    return null;
-                }
-
-                try excludeList.append(allocator, class.?);
             } else {
                 break;
             }
