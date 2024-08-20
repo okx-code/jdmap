@@ -1,3 +1,6 @@
+> [!NOTE]  
+> This project has been made redundant by Paper shipping remapped jars in 1.20.5+. Debugging NMS works out of the box.
+
 # JDWP Remapper
 
 ## The Problem
